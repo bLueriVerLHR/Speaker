@@ -1,0 +1,32 @@
+# Local working docs (contain machine-specific info; never push)
+AGENTS.md
+PLAN.md
+
+# Third-party baseline implementations and papers (read-only, not tracked);
+# baselines/ own scripts (dense + MoD + RT baselines) ARE tracked
+baselines/router-tuning/
+baselines/mixture-of-depths/
+baselines/papers/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Runtime artifacts (log archives / checkpoints are not tracked)
+.logs/
+.archive/
+*.pt
+*.bin
+*.safetensors
+
+# Probe/eval outputs
+/tmp/
+*.log
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
