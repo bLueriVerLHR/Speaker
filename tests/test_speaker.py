@@ -66,6 +66,21 @@ def test_config():
     c2 = SpeakerConfig(num_hidden_layers=8, hidden_size=32, always_on_head=3, always_on_tail=2)
     assert c2.always_on_layers == [0, 1, 2, 6, 7], c2.always_on_layers
     assert c2.gated_layers == [3, 4, 5]
+    # ed5: None derives from head/tail; an explicit [] stays empty (pure gating, r6) —
+    # the old falsy check refilled [] from head/tail, silently resurrecting fixed layers
+    c3 = SpeakerConfig(num_hidden_layers=8, hidden_size=32, always_on_layers=[],
+                       always_on_head=2, always_on_tail=2)
+    assert c3.always_on_layers == [] and c3.gated_layers == list(range(8)), c3.always_on_layers
+    c4 = SpeakerConfig(num_hidden_layers=8, hidden_size=32, always_on_layers=None,
+                       always_on_head=1, always_on_tail=1)
+    assert c4.always_on_layers == [0, 7], c4.always_on_layers
+    # from_model_config must fail fast on configs without layer info (not TypeError deep
+    # inside __post_init__)
+    try:
+        SpeakerConfig.from_model_config({})
+        raise AssertionError("from_model_config should reject a config without layer info")
+    except ValueError:
+        pass
     # threshold mode checks
     ct = SpeakerConfig(num_hidden_layers=6, hidden_size=32, gate_mode="threshold", tau_init=-1.0)
     assert ct.gate_mode == "threshold" and ct.tau_init == -1.0

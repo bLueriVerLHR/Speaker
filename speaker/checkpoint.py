@@ -70,9 +70,17 @@ def save_clean_base(mod_model, tok=None, cfg=None, save_dir: str = "."):
 
 def load_gate(mod_model, ckpt_dir: str, filename: str = "gate.pt"):
     """Loads gate.pt (strict=False, returns (missing, unexpected) for the caller to
-    assert/print)."""
+    assert/print). Warns loudly when gating/LoRA keys end up missing — the silent
+    strict=False drop historically masked wrong-scheme ckpts and unwrapped LoRA
+    (r1 pitfall: eval quietly scored a half-initialized model)."""
     sd = torch.load(os.path.join(ckpt_dir, filename), map_location="cpu")
-    return mod_model.load_state_dict(sd, strict=False)
+    missing, unexp = mod_model.load_state_dict(sd, strict=False)
+    gate_missing = [k for k in missing if is_gate_key(k) or "lora_" in k]
+    if gate_missing:
+        print(f"WARNING: {len(gate_missing)} gating/LoRA keys missing after loading "
+              f"{filename} (e.g. {gate_missing[:3]}); ckpt scheme or LoRA spec likely "
+              f"mismatched — those gates silently run at fresh initialization", flush=True)
+    return missing, unexp
 
 
 def strip_promoted_gate(state_dict: dict, promoted) -> dict:

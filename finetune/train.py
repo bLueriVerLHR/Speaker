@@ -55,10 +55,11 @@ def parse_args():
     p.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--max_length", type=int, default=256)
-    p.add_argument("--steps", "--anneal_steps", dest="anneal_steps", type=int, default=100,
+    p.add_argument("--anneal_steps", type=int, default=100,
                    help="annealing horizon (denominator of the Ta/gumbel annealing schedule, "
-                        "part of our method's definition, keep fixed); "
-                        "--steps is a legacy alias (semantics = annealing horizon, NOT the stop step; stopping is governed by --max_steps)")
+                        "part of our method's definition, keep fixed); stopping is governed "
+                        "solely by --max_steps (ed5: the --steps legacy alias was removed after "
+                        "two smoke incidents)")
     p.add_argument("--max_steps", type=int, default=3000,
                    help="hard step cap; actual stopping is decided by the ed3 unified convergence rule (StopOnPlateau)")
     p.add_argument("--lr", type=float, default=2e-5)
@@ -225,9 +226,7 @@ def main():
 
     dense_res = None
     if eval_texts:
-        eval_coll = make_collate(tok, device, args.max_length,
-                                 args.use_chat_template, args.mask_user_tokens)
-        dense_res = eval_heldout(model, eval_texts, eval_coll)
+        dense_res = eval_heldout(model, eval_texts, coll_fn)
         print(f"heldout dense baseline: loss {dense_res['loss']:.3f} acc {dense_res['acc']:.3f} "
               f"({len(eval_texts)} samples)", flush=True)
 
@@ -401,9 +400,9 @@ def main():
                     + (f" ul {ul.item():.2f}" if ul is not None else ""))
                 window_t0 = time.time()
                 window_tokens = 0
-            if step % stopper.eval_every == 0 and step > 0 and stop_subset:
+            if step % stopper.eval_every == 0 and stop_subset:
                 # plateau check (eval_heldout restores train mode itself); per-layer load written to layers.jsonl at low frequency
-                chk = eval_heldout(mod_model, stop_subset, eval_coll)
+                chk = eval_heldout(mod_model, stop_subset, coll_fn)
                 rl.layers(step, mod_model.get_layer_usage(), cfg.always_on_layers)
                 with open(os.path.join(args.save_dir, "converge.jsonl"), "a", encoding="utf-8") as f:
                     f.write(json.dumps({"step": step, "subset_loss": chk["loss"],
@@ -431,19 +430,16 @@ def main():
         mod_model.hf_model.save_pretrained(args.save_dir,
                                            state_dict=clean_base_state_dict(mod_model))
         tok.save_pretrained(args.save_dir)
+    rl.close()
     print(f"saved to {args.save_dir}", flush=True)
     # Final eval: same-distribution held-out; accuracy delta = Speaker - dense baseline, at a glance
     if eval_texts and dense_res is not None:
-        mod_res = eval_heldout(mod_model, eval_texts, eval_coll)
+        mod_res = eval_heldout(mod_model, eval_texts, coll_fn)
         print(f"heldout | dense loss {dense_res['loss']:.3f} acc {dense_res['acc']:.3f} "
               f"| mod loss {mod_res['loss']:.3f} acc {mod_res['acc']:.3f} "
               f"(Δloss {mod_res['loss'] - dense_res['loss']:+.3f} Δacc {mod_res['acc'] - dense_res['acc']:+.3f}) "
               f"| k {mod_res['mean_k']:.1f}±{mod_res['std_k']:.1f} "
               f"quartile {[round(v, 1) for v in mod_res['quartile_k']]}", flush=True)
-
-
-def dtype_of(name):
-    return {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[name]
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ def parse_args():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--max_length", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--steps", type=int, default=500,
+    p.add_argument("--max_steps", type=int, default=500,
                    help="display/annealing horizon alignment slot (actual stopping is decided by the ed3 unified convergence rule)")
     p.add_argument("--lr", type=float, default=3e-5, help="unified single-group lr (same as the LoRA-version baselines)")
     p.add_argument("--max_samples", type=int, default=1000)
@@ -78,7 +78,7 @@ def main():
     opt = torch.optim.AdamW(groups, weight_decay=0.01)
     dl = DataLoader(full, batch_size=args.batch_size, shuffle=True, collate_fn=coll_fn)
     os.makedirs(args.save_dir, exist_ok=True)
-    stopper = StopOnPlateau()  # ed3 unified convergence rule (same constants as ours and the three baselines)
+    stopper = StopOnPlateau(max_steps=args.max_steps)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
     stop_subset = eval_texts[:40]  # subset for plateau checks (saves time); final eval still uses the full set
     step, ema_lm, ema_acc = 0, None, None
     t0 = time.time()
@@ -107,10 +107,10 @@ def main():
                 mem = (f" mem {torch.cuda.memory_allocated(device) / 1024**3:.2f}GB"
                        if device.type == "cuda" else "")
                 window_tokens, window_t0 = 0, time.time()
-                print(f"[{time.strftime('%H:%M:%S')}] step {step:4d}/{args.steps} lm {lm.item():.3f} "
+                print(f"[{time.strftime('%H:%M:%S')}] step {step:4d}/{args.max_steps} lm {lm.item():.3f} "
                       f"ema {ema_lm:.3f} acc {acc_item:.2f}/{ema_acc:.2f} "
                       f"{rate:.0f}tok/s{mem} {time.time() - t0:.0f}s", flush=True)
-            if step % stopper.eval_every == 0 and step > 0:
+            if step % stopper.eval_every == 0:
                 chk = eval_heldout(model, stop_subset, coll_eval)
                 with open(os.path.join(args.save_dir, "converge.jsonl"), "a", encoding="utf-8") as f:
                     f.write(json.dumps({"step": step, "subset_loss": chk["loss"],

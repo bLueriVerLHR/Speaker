@@ -26,7 +26,7 @@ learning this division of labor.
   layers.jsonl / one-line stdout status.
 
 Usage (smoke):
-  python3 pretrain/train.py --device cuda:0 --steps 8 --max_samples 60 --eval_samples 8 \
+  python3 pretrain/train.py --device cuda:0 --max_steps 8 --max_samples 60 --eval_samples 8 \
       --log_interval 4 --price_warmup 3 --budget_ramp 6 --save_dir /tmp/speaker_pretrain_smoke
 """
 import argparse
@@ -72,7 +72,9 @@ def parse_args():
     p.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16", "float16"])
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--max_length", type=int, default=256)
-    p.add_argument("--steps", type=int, default=100)
+    p.add_argument("--max_steps", type=int, default=100,
+                   help="hard stop cap (ed5: renamed from --steps to match the finetune/baselines "
+                        "convention — one name, one meaning across all training scripts)")
     p.add_argument("--lr", type=float, default=3e-4, help="from-scratch training defaults to a larger lr (finetune uses 2e-5)")
     p.add_argument("--router_lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=42, help="fixed seed for from-scratch training (reproducibility first)")
@@ -150,7 +152,6 @@ def main():
     full, eval_texts = split_train_eval(args.data_path, args.max_samples, args.eval_samples)
     ds = full
     coll_fn = make_collate(tok, device, args.max_length)
-    eval_coll = make_collate(tok, device, args.max_length)
 
     overrides = dict(kmax=args.kmax, gate_mode=args.gate_mode,
                      select_mode=args.select_mode, top_p=args.top_p,
@@ -192,9 +193,9 @@ def main():
     for epoch in range(100):
         for b in dl:
             step += 1
-            if step > args.steps:
+            if step > args.max_steps:
                 break
-            mod_model.anneal(step, args.steps, ta_end=args.ta_end, g_end=0.0)
+            mod_model.anneal(step, args.max_steps, ta_end=args.ta_end, g_end=0.0)
             out = mod_model(**b)
             lm_loss = out.loss
             aux = mod_model.get_aux_loss()
@@ -251,9 +252,9 @@ def main():
                     rl.layers(step, usage, cfg.always_on_layers)
                 window_t0 = time.time()
                 window_tokens = 0
-            if step >= args.steps:
+            if step >= args.max_steps:
                 break
-        if step >= args.steps:
+        if step >= args.max_steps:
             break
     rl.close()
 
@@ -262,7 +263,7 @@ def main():
     print(f"saved to {args.save_dir} (clean base+tokenizer+mod_config.json+gate.pt)", flush=True)
     if eval_texts:
         mod_model.set_skip_mode("hard")
-        res = eval_heldout(mod_model, eval_texts, eval_coll)
+        res = eval_heldout(mod_model, eval_texts, coll_fn)
         print(f"heldout (hard): loss {res['loss']:.3f} acc {res['acc']:.3f} "
               f"| k {res['mean_k']:.1f}±{res['std_k']:.1f} "
               f"quartile {[round(v, 1) for v in res['quartile_k']]}", flush=True)

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import List, Optional
 
 SKIP_MODES = ("soft", "hard")
@@ -40,7 +40,7 @@ class SpeakerConfig:
     num_hidden_layers: int = 24
     hidden_size: int = 1024
     gate_mode: str = "moe"  # moe (hierarchical MoE joint routing, default mainline) | threshold (legacy per-layer threshold gating)
-    always_on_layers: List[int] = field(default_factory=list)  # explicit fixed-layer list (written after profile promotion)
+    always_on_layers: Optional[List[int]] = None  # None = derive from head/tail; [] = explicitly no fixed layers (pure gating); explicit list overrides head/tail
     always_on_head: int = 2  # first m layers fixed/shared (foundation: syntax/representation)
     always_on_tail: int = 2  # last n layers fixed/shared (output: speaking/prediction)
     # ---- Selection (moe only): in log p space ----
@@ -75,9 +75,11 @@ class SpeakerConfig:
     skip_mode: str = "soft"  # soft for training (hard selection in forward), hard for deployment (layer skipping saves memory)
 
     def __post_init__(self):
-        if not self.always_on_layers:
-            # first m + last n always resident, middle optional (m/n configurable;
-            # the default 2/2 is the ablation-validated configuration)
+        if self.always_on_layers is None:
+            # None = unset: first m + last n always resident, middle optional (m/n
+            # configurable; the default 2/2 is the ablation-validated configuration).
+            # An explicit empty list stays empty (pure-gating startup, r6) — only None
+            # derives from head/tail, so a saved [] reloads as [].
             N = self.num_hidden_layers
             self.always_on_layers = list(range(max(self.always_on_head, 0))) + \
                 list(range(max(N - max(self.always_on_tail, 0), 0), N))
@@ -140,6 +142,10 @@ class SpeakerConfig:
         else:
             n = getattr(hf_config, "num_hidden_layers", None)
             h = getattr(hf_config, "hidden_size", None)
+        if n is None or h is None:
+            raise ValueError(
+                f"cannot infer num_hidden_layers/hidden_size from the given config "
+                f"(got N={n!r}, H={h!r}); pass them explicitly via overrides")
         base = dict(num_hidden_layers=n, hidden_size=h)
         base.update(overrides)
         return cls(**base)

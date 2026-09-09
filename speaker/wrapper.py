@@ -53,6 +53,20 @@ class SpeakerLayerWrapper(nn.Module):
         self._last_sim: Optional[torch.Tensor] = None  # detached layer input/output cos similarity [B,T]
         self._returns_tuple = True    # HF decoder layers return a tuple by default; assume True, correct after execution
         self._skip_hits = 0           # decode-time sparse skip counter (diagnostics)
+        # Hot-path gates (ed5): usage stats accumulate as GPU-side fp64 tensors — the
+        # historical per-step float() forced a GPU->CPU pipeline sync on every gated layer
+        # every step; values are synced to float only when get_layer_usage reads them.
+        # _need_sim skips the cosine-similarity diagnostics when nothing consumes them
+        # (moe with cos_reg_coef=0; threshold always keeps it — calibrate_tau reads
+        # _last_sim for its initialization).
+        self._need_sim = (not self.is_always_on) and (
+            config.gate_mode == "threshold" or config.cos_reg_coef > 0)
+        # Load accumulators (hard/soft usage over a window; single-step noise at batch=1 is
+        # large, read window means). fp64 tensor sums are bit-identical to the historical
+        # Python-float accumulation (fp32 per-step sum widened exactly, then added in fp64).
+        self._use_hard = None   # Optional[torch.Tensor], created on first gated forward
+        self._use_soft = None   # Optional[torch.Tensor]
+        self._use_n = 0
         if self.is_always_on:
             self.router = None
             self.tau = None
@@ -62,18 +76,10 @@ class SpeakerLayerWrapper(nn.Module):
             self.tau = nn.Parameter(torch.tensor(float(config.tau_init)))
             # Skip compensation (DASH-style): learnable bias added when skipped, zero init = legacy behavior
             self.comp = nn.Parameter(torch.zeros(config.hidden_size))
-            # Load accumulators (hard/soft usage over a window; single-step noise at batch=1 is
-            # large, read window means)
-            self._use_hard = 0.0
-            self._use_soft = 0.0
-            self._use_n = 0
         else:  # moe
             self.router = None
             self.tau = None
             self.comp = None
-            self._use_hard = 0.0
-            self._use_soft = 0.0
-            self._use_n = 0
 
     # ---------- Gating (threshold) ----------
 
@@ -101,15 +107,20 @@ class SpeakerLayerWrapper(nn.Module):
         if self.config.z_loss_coef > 0:
             aux = self.config.z_loss_coef * r_logits.pow(2).mean()
         with torch.no_grad():
-            self._use_hard += float(hard.sum())
-            self._use_soft += float(soft.sum())
+            # GPU-side fp64 accumulation, no per-step sync (see __init__ note)
+            if self._use_hard is None:
+                self._use_hard = hard.sum().double()
+                self._use_soft = soft.sum().double()
+            else:
+                self._use_hard += hard.sum()
+                self._use_soft += soft.sum()
             self._use_n += hard.numel()
         return GatingOutput(mask=mask, soft_mask=soft, hard_mask=hard,
                             router_logits=r_logits, aux_loss=aux)
 
     # ---------- Route slicing (moe) ----------
 
-    def _consume_route(self) -> GatingOutput:
+    def _consume_route(self, dev: Optional[torch.device] = None) -> GatingOutput:
         hub = self._hub
         if hub is None:
             raise RuntimeError("gated layers in moe mode must be built via convert_to_speaker (joint routing requires the hub)")
@@ -117,11 +128,14 @@ class SpeakerLayerWrapper(nn.Module):
         if route is None:
             raise RuntimeError("missing routing decision: gated layers must run inside a full model forward (entry layer first)")
         j = self._slot
-        return GatingOutput(
-            mask=route.weights[..., j:j + 1],
-            soft_mask=route.probs[..., j:j + 1],
-            hard_mask=route.selected[..., j:j + 1],
-            router_logits=route.logits[..., j:j + 1])
+        w, s, h, lg = (route.weights[..., j:j + 1], route.probs[..., j:j + 1],
+                       route.selected[..., j:j + 1], route.logits[..., j:j + 1])
+        if dev is not None and w.device != dev:
+            # placement: the route lives on the entry layer's device; realign this
+            # layer's slice so mixing/stepping and the usage stats stay on-device.
+            # Single-device forwards take the no-move path (bit-identical to history).
+            w, s, h, lg = w.to(dev), s.to(dev), h.to(dev), lg.to(dev)
+        return GatingOutput(mask=w, soft_mask=s, hard_mask=h, router_logits=lg)
 
     # ---------- Skip path (shared by both schemes) ----------
 
@@ -174,11 +188,12 @@ class SpeakerLayerWrapper(nn.Module):
         mixed = hidden_states + m * (layer_hidden - hidden_states)
         if self.comp is not None:
             mixed = mixed + (1.0 - m) * self.comp.to(layer_hidden.dtype)
-        with torch.no_grad():
-            sim = F.cosine_similarity(hidden_states.float(), layer_hidden.float(), dim=-1)  # [B,T]
-            if attention_mask is not None and attention_mask.dim() == 2:
-                sim = sim * attention_mask.to(sim.dtype)
-            self._last_sim = sim.detach()
+        if self._need_sim:
+            with torch.no_grad():
+                sim = F.cosine_similarity(hidden_states.float(), layer_hidden.float(), dim=-1)  # [B,T]
+                if attention_mask is not None and attention_mask.dim() == 2:
+                    sim = sim * attention_mask.to(sim.dtype)
+                self._last_sim = sim.detach()
         return (mixed, *rest) if self._returns_tuple else mixed
 
     def forward(self, hidden_states: torch.Tensor, *args, attention_mask=None, **kwargs):
@@ -205,11 +220,16 @@ class SpeakerLayerWrapper(nn.Module):
         weighted residual / skip."""
         if self._is_entry:
             self._hub._compute_route(hidden_states, attention_mask)
-        g = self._consume_route()
+        g = self._consume_route(hidden_states.device)
         self._last = g
         with torch.no_grad():
-            self._use_hard += float(g.hard_mask.sum())
-            self._use_soft += float(g.soft_mask.sum())
+            # GPU-side fp64 accumulation, no per-step sync (see __init__ note)
+            if self._use_hard is None:
+                self._use_hard = g.hard_mask.sum().double()
+                self._use_soft = g.soft_mask.sum().double()
+            else:
+                self._use_hard += g.hard_mask.sum()
+                self._use_soft += g.soft_mask.sum()
             self._use_n += g.hard_mask.numel()
         if self.config.skip_mode == "hard" and bool((g.hard_mask == 0).all()):
             skipped = self._try_skip(hidden_states, kwargs)
@@ -413,14 +433,22 @@ class SpeakerModelWrapper(nn.Module):
         return loss
 
     def _stack_masks(self):
-        """Returns ste/weights[B,T,G], soft[B,T,G], hard[B,T,G]"""
+        """Returns ste/weights[B,T,G], soft[B,T,G], hard[B,T,G] (stacked on one device —
+        under placement the per-layer slices may live on different devices)."""
         ls = self._gated()
         if not ls:
             return None, None, None
-        ste = torch.stack([w.last_gating_output.mask.squeeze(-1) for w in ls], dim=-1)
-        soft = torch.stack([w.last_gating_output.soft_mask.squeeze(-1) for w in ls], dim=-1)
-        hard = torch.stack([w.last_gating_output.hard_mask.squeeze(-1) for w in ls], dim=-1)
-        return ste, soft, hard
+
+        def _stack(get):
+            ms = [get(w).squeeze(-1) for w in ls]
+            d0 = ms[0].device
+            if any(m.device != d0 for m in ms):
+                ms = [m.to(d0) for m in ms]
+            return torch.stack(ms, dim=-1)
+
+        return (_stack(lambda w: w.last_gating_output.mask),
+                _stack(lambda w: w.last_gating_output.soft_mask),
+                _stack(lambda w: w.last_gating_output.hard_mask))
 
     def get_active_counts(self, hard: bool = True):
         """Per-token active layer count [B,T] (hard or soft accounting)."""
@@ -515,16 +543,18 @@ class SpeakerModelWrapper(nn.Module):
 
     def get_layer_usage(self, reset: bool = True):
         """Per-layer usage rate over the window {idx:(hard rate, soft rate)}, always_on recorded
-        as 1.0. Resets on read."""
+        as 1.0. Resets on read. The GPU->CPU sync happens only here (read time), not per step."""
         d = {}
         for w in self.layers:
             if w.is_always_on:
                 d[w.layer_idx] = (1.0, 1.0)
             else:
                 n = max(w._use_n, 1)
-                d[w.layer_idx] = (w._use_hard / n, w._use_soft / n)
+                hard = float(w._use_hard) if torch.is_tensor(w._use_hard) else 0.0
+                soft = float(w._use_soft) if torch.is_tensor(w._use_soft) else 0.0
+                d[w.layer_idx] = (hard / n, soft / n)
                 if reset:
-                    w._use_hard = w._use_soft = 0.0
+                    w._use_hard = w._use_soft = None
                     w._use_n = 0
         return d
 
@@ -535,6 +565,19 @@ class SpeakerModelWrapper(nn.Module):
             for w in self.layers:
                 w._skip_hits = 0
         return n
+
+    def pop_layer_counts(self) -> dict:
+        """Raw per-layer hard-activation token counts since the last read (read-and-reset,
+        gated layers only). Feeds the placement scheduler's LFU/LRU statistics; resets the
+        same accumulators get_layer_usage reads (whoever reads first wins the window)."""
+        d = {}
+        for w in self.layers:
+            if w.is_always_on:
+                continue
+            d[w.layer_idx] = int(w._use_hard.item()) if torch.is_tensor(w._use_hard) else 0
+            w._use_hard = w._use_soft = None
+            w._use_n = 0
+        return d
 
     def get_tau_params(self):
         """threshold: current τ parameter values (diagnosing imbalance); moe: empty dict."""
@@ -595,6 +638,18 @@ class SpeakerModelWrapper(nn.Module):
         n = sum(p.numel() * p.element_size() for p in self.parameters() if p.device.type == device_type)
         n += sum(b.numel() * b.element_size() for b in self.buffers() if b.device.type == device_type)
         return n / 1e9
+
+    def schedule_placement(self, strategy: str = "lfu", **kwargs):
+        """Scheduled placement for CPU-GPU collaborative inference (ed5): fixed layers stay
+        resident on the GPU, gated layers are scheduled into the leftover weights budget
+        (GPU allowance minus a KV-cache/activation reserve) by a pluggable strategy
+        (random | lru | lfu — see speaker/scheduler.py). Plans and applies once, returns
+        the LayerScheduler; call sched.reschedule() between generations to re-plan from
+        the observed activation counters."""
+        from .scheduler import LayerScheduler
+        sched = LayerScheduler(self, strategy, **kwargs)
+        sched.reschedule()
+        return sched
 
     # ----- Inference / annealing controls -----
 

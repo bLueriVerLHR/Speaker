@@ -22,7 +22,7 @@ ckpt: modd_config.json + routers.pt + full base (joint training modifies the bas
 Mechanisms (layer forward/patch/stats/eval) live in baselines/lib.py; this file keeps only the CLI and the training loop.
 Usage:
   python3 baselines/train_mod.py --model_id /home/hdd/model/Qwen1.5-0.5B \
-      --steps 3000 --save_dir /tmp/modd_q05
+      --max_steps 3000 --save_dir /tmp/modd_q05
 """
 import argparse
 import json
@@ -56,7 +56,7 @@ def parse_args():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--max_length", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--steps", type=int, default=3000,
+    p.add_argument("--max_steps", type=int, default=3000,
                    help="hard cap on steps; actual stopping is decided by the ed3 unified convergence rule (StopOnPlateau)")
     p.add_argument("--lr", type=float, default=3e-5,
                    help="unified single-group lr (the paper has no fine-tuning recipe; same regime-conversion setting as the MoDification paper)")
@@ -125,7 +125,7 @@ def main():
     opt = torch.optim.AdamW(groups, weight_decay=0.01)
     dl = DataLoader(full, batch_size=args.batch_size, shuffle=True, collate_fn=coll_fn)
     os.makedirs(args.save_dir, exist_ok=True)
-    stopper = StopOnPlateau()  # ed3 unified convergence rule (same constants as ours/RT/mdf)
+    stopper = StopOnPlateau(max_steps=args.max_steps)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
     stop_subset = eval_texts[:40]  # subset for plateau checks (saves time); final eval still uses the full set
     step, ema_lm, ema_k = 0, None, None
     t0 = time.time()
@@ -156,11 +156,11 @@ def main():
                 mem = (f" mem {torch.cuda.memory_allocated(device) / 1024**3:.2f}GB"
                        if device.type == "cuda" else "")
                 window_tokens, window_t0 = 0, time.time()
-                print(f"[{time.strftime('%H:%M:%S')}] step {step:4d}/{args.steps} lm {lm.item():.3f} "
+                print(f"[{time.strftime('%H:%M:%S')}] step {step:4d}/{args.max_steps} lm {lm.item():.3f} "
                       f"ema {ema_lm:.3f} bce {bce.item() if bce is not None else 0:.3f} "
                       f"cap {cap_now:.3f} k {ema_k:.1f} {rate:.0f}tok/s{mem} "
                       f"{time.time() - t0:.0f}s", flush=True)
-            if step % stopper.eval_every == 0 and step > 0:
+            if step % stopper.eval_every == 0:
                 # plateau check (eval_heldout_modd restores train mode automatically)
                 chk = eval_heldout_modd(model, routed, n_dense, stop_subset, coll_eval)
                 with open(os.path.join(args.save_dir, "converge.jsonl"), "a", encoding="utf-8") as f:

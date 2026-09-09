@@ -41,7 +41,7 @@ def parse_args():
     p.add_argument("--data_path", default="./data/sft_t2t_mini.jsonl")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--max_length", type=int, default=256)
-    p.add_argument("--steps", type=int, default=3000,
+    p.add_argument("--max_steps", type=int, default=3000,
                    help="hard cap on steps; actual stopping is decided by the ed3 unified convergence rule (StopOnPlateau)")
     p.add_argument("--lr", type=float, default=1e-5, help="RT official default")
     p.add_argument("--max_samples", type=int, default=1000, help="same slice as kl2 (first 1000 train / last 100 eval)")
@@ -98,7 +98,7 @@ def main():
     opt = torch.optim.AdamW([{"params": routers, "lr": args.lr}], weight_decay=0.0)
     dl = DataLoader(full, batch_size=1, shuffle=True, collate_fn=coll_fn)
     os.makedirs(args.save_dir, exist_ok=True)
-    stopper = StopOnPlateau()  # ed3 unified convergence rule (same constants as ours/MoD/mdf)
+    stopper = StopOnPlateau(max_steps=args.max_steps)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
     stop_subset = eval_texts[:40]  # subset for plateau checks (saves time); final eval still uses the full set
     step, ema_lm, ema_cap = 0, None, None
     t0 = time.time()
@@ -126,11 +126,11 @@ def main():
                 mem = (f" mem {torch.cuda.memory_allocated(device) / 1024**3:.2f}GB"
                        if device.type == "cuda" else "")
                 window_tokens, window_t0 = 0, time.time()
-                print(f"step {step:4d}/{args.steps} lm {lm.item():.3f} ema {ema_lm:.3f} "
+                print(f"step {step:4d}/{args.max_steps} lm {lm.item():.3f} ema {ema_lm:.3f} "
                       f"cap {mod_loss.item() if mod_loss is not None else 0:.3f} "
                       f"exec {cap:.2f}/{ema_cap:.2f} k_est {k_est:.1f} {rate:.0f}tok/s{mem} "
                       f"{time.time() - t0:.0f}s", flush=True)
-            if step % stopper.eval_every == 0 and step > 0:
+            if step % stopper.eval_every == 0:
                 # plateau check (eval_heldout_rt restores train mode automatically)
                 chk = eval_heldout_rt(model, gated, stop_subset, coll_eval, n_always=n_dense)
                 with open(os.path.join(args.save_dir, "converge.jsonl"), "a", encoding="utf-8") as f:

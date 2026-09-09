@@ -10,21 +10,30 @@ loss/acc values are bit-identical to the original three eval_heldout_* functions
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
-import sys
 from types import MethodType
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "router-tuning"))
-from utils.model.model_patch import (  # noqa: E402
-    _apply_routing_mask,
-    _compute_routing_state,
-    _parse_granularity,
-)
+# Third-party read-only code (gitignored): RT's routing math primitives, loaded by file
+# path — no sys.path pollution with the generic top-level name "utils" (ed5). The file is
+# torch-only, so a spec load is equivalent to the historical package import.
+_RT_PATCH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "router-tuning", "utils", "model", "model_patch.py")
+if not os.path.exists(_RT_PATCH):
+    raise ImportError(
+        f"Router-Tuning baseline needs the third-party model_patch.py at {_RT_PATCH} "
+        "(gitignored; see the baselines section of the README for how to obtain it)")
+_spec = importlib.util.spec_from_file_location("rt_model_patch", _RT_PATCH)
+_mp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mp)
+_apply_routing_mask = _mp._apply_routing_mask
+_compute_routing_state = _mp._compute_routing_state
+_parse_granularity = _mp._parse_granularity
 
 from speaker.checkpoint import gate_state_dict, is_base_key, strip_wrapper_prefix  # noqa: E402
 from speaker.evaluate import eval_heldout  # noqa: E402

@@ -246,6 +246,8 @@ def main():
         sd = torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu")
         missing, unexp = m2.load_state_dict(sd, strict=False)
         m2.to(device)
+        n_drop = sum(1 for k in missing if "lora" in k or "router" in k)
+        assert n_drop == 0, f"[{ckpt}] routers.pt keys did not match (LoRA spec inconsistent with training?)"
         print(f"[{os.path.basename(ckpt)}] routers.pt missing {len(missing)} "
               f"unexpected {len(unexp)}", flush=True)
         n_mod = sum(rc["is_mod"])
