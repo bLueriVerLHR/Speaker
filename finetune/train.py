@@ -120,6 +120,12 @@ def parse_args():
                    help="threshold: number of model-aware tau calibration batches before training (0=off, uses the tau_init constant)")
     p.add_argument("--tau_spread", type=float, default=0.5,
                    help="threshold: tau calibration spread (by per-layer stability z-score)")
+    p.add_argument("--router_calib_batches", type=int, default=0,
+                   help="moe: number of router-temperature calibration batches before training (0=off/legacy); "
+                        "calibrates the JointRouter logit temperature so the initial top-p mean k starts near "
+                        "--router_start_k (near-dense healthy start, mirrors threshold's tau calibration)")
+    p.add_argument("--router_start_k", type=int, default=0,
+                   help="moe: target initial mean k for router calibration (0 = auto, ~0.6*gated)")
     p.add_argument("--resume_dir", default="",
                    help="resume from a ckpt: structure follows mod_config.json (including gate_mode), gating params are overlaid, "
                         "annealing/price are re-scheduled from the CLI (temp/gumbel/price reset to initial values)")
@@ -294,6 +300,21 @@ def main():
             vals = list(new_taus.values())
             print(f"tau calibrated: [{min(vals):+.2f},{max(vals):+.2f}] "
                   f"(init {args.tau_init:+.2f} spread {args.tau_spread})", flush=True)
+        mod_model.train()
+
+    if args.router_calib_batches > 0 and not args.resume_dir and cfg.gate_mode == "moe":
+        calib = []
+        for b in DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                            collate_fn=coll_fn):
+            calib.append(b)
+            if len(calib) >= args.router_calib_batches:
+                break
+        info = mod_model.calibrate_router_temp(
+            calib, target_k=(args.router_start_k or None))
+        if info:
+            print(f"router temp calibrated: {info['router_temp']:.3f} "
+                  f"(k0 {info['k_before']:.1f} -> {info['k_after']:.1f}, "
+                  f"target {info['target_k']})", flush=True)
         mod_model.train()
 
     groups, base_params, gate_params = build_param_groups(

@@ -11,6 +11,7 @@ ckpt: lora.pt (lora_ keys) + denseft_config.json; base loaded from --model_id (e
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -41,6 +42,10 @@ def parse_args():
     p.add_argument("--eval_samples", type=int, default=100)
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_dir", default="/tmp/denseft_baseline")
+    p.add_argument("--seed", type=int, default=None,
+                   help="random seed (unset by default, preserving legacy behavior)")
+    p.add_argument("--patience", type=int, default=3,
+                   help="StopOnPlateau patience (enlarge to guarantee running to --max_steps)")
     p.add_argument("--use_lora", default=True, action=argparse.BooleanOptionalAction,
                    help="same-spec LoRA as ours/baselines (fairly fine-tuned dense); off = pure raw dense, for smoke tests")
     p.add_argument("--lora_rank", type=int, default=8, help="same spec as finetune/train.py")
@@ -51,6 +56,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     tok = build_tok(args.model_id)
     model = build_model(args.model_id, device)
@@ -72,13 +80,17 @@ def main():
     groups = [{"params": trainable, "lr": args.lr}]
     print(f"trainable {sum(p.numel() for p in trainable) / 1e6:.1f}M params "
           f"(lora={args.use_lora}), k fixed {n_layers}", flush=True)
-    if not args.use_lora and hasattr(model, "gradient_checkpointing_enable"):
+    if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
+        if args.use_lora:
+            # r7 OOM fix: bs2 x len1024 x 7B LoRA needs checkpointing; the frozen-embed backward
+            # pitfall is solved by enable_input_require_grads (same as finetune/train.py since r5)
+            model.enable_input_require_grads()
 
     opt = torch.optim.AdamW(groups, weight_decay=0.01)
     dl = DataLoader(full, batch_size=args.batch_size, shuffle=True, collate_fn=coll_fn)
     os.makedirs(args.save_dir, exist_ok=True)
-    stopper = StopOnPlateau(max_steps=args.max_steps)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
+    stopper = StopOnPlateau(max_steps=args.max_steps, patience=args.patience)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
     stop_subset = eval_texts[:40]  # subset for plateau checks (saves time); final eval still uses the full set
     step, ema_lm, ema_acc = 0, None, None
     t0 = time.time()

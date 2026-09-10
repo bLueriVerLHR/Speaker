@@ -50,6 +50,10 @@ class SpeakerConfig:
     min_layers: int = 1            # minimum gated layers activated per token
     kmax: int = 10                 # moe: hard cap during selection; threshold: safety cap
     count_temp: float = 0.1        # soft-inclusion sigmoid temperature (STE backward; smaller = closer to hard)
+    router_temp: float = 1.0       # moe only: persistent JointRouter logit temperature, calibrated at init so
+                                   # the top-p mean k starts near the target (1.0 = off/legacy; r7 evidence:
+                                   # uncalibrated random projection over large-norm hiddens starts peaked and
+                                   # collapses during the budget ramp)
     # ---- Budget (shared; price accounting = actual demand per inference, avg only, no peak/residency) ----
     sparsity_price: float = 0.03   # λ, loss += λ·mean(k)
     price_min: float = 1e-4        # >0: multiplicative dual adjustment can climb back after hitting the floor (0 forbidden)

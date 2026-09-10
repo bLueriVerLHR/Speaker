@@ -28,6 +28,20 @@ The entry layer computes the route once per forward pass and stores it in the
 model hub; every other gated layer consumes its own slice (`_consume_route`),
 re-aligned to that layer's device in mixed CPU/GPU placement.
 
+### Init calibration (router temperature)
+
+A randomly initialized `JointRouter` over large-norm hidden states (7B) starts
+**peaked**: the initial top-p mean k lands far below the near-dense start the
+threshold scheme gets from `calibrate_tau`. Training from such a start collapses
+during the budget ramp (r7: k sank 4.9→1.7, accuracy never took off — the STE
+soft-inclusion saturates and the dual price cannot reopen gates it already
+stopped pressing). `calibrate_router_temp` (finetune `--router_calib_batches`,
+0 = legacy off) caches entry hiddens from a few batches and bisects a persistent
+logit temperature (`router_temp`, stored in `mod_config.json`, never in
+`gate.pt` — key sets unchanged; 1.0 = bit-for-bit identity) until the initial
+mean k reaches the target (`--router_start_k`, default ≈ 0.6·G). Only flattening
+is applied: a start that is already dense enough is left untouched.
+
 ### Selection: top-p (k adapts per token)
 
 Layers are sorted by probability; the smallest prefix whose cumulative probability

@@ -280,6 +280,52 @@ def test_budget_moe():
     print("[PASS] eval deterministic + hard forward (moe)")
 
 
+def test_router_temp_calib():
+    """moe: init-time router-temperature calibration (r7 fix): a peaked start (large-norm
+    random projection, mimics 7B) is flattened until the top-p mean k reaches the target;
+    router_temp=1.0 must stay bit-for-bit identity; threshold returns {}."""
+    n, h = 12, 32
+    torch.manual_seed(0)
+    cfg = SpeakerConfig(num_hidden_layers=n, hidden_size=h, gate_mode="moe",
+                        select_mode="topp", top_p=0.7, kmax=8, gumbel_scale=0.0)
+    mod = SpeakerModelWrapper(FakeHF(n=n, h=h), cfg)
+    assert cfg.gated_layers == list(range(2, 10)), cfg.gated_layers
+    # threshold mirror: no-op
+    mod2 = SpeakerModelWrapper(FakeHF(n=n, h=h),
+                               SpeakerConfig(num_hidden_layers=n, hidden_size=h,
+                                             gate_mode="threshold"))
+    assert mod2.calibrate_router_temp([{"hidden_states": torch.randn(2, 4, h)}]) == {}
+    # identity: router_temp=1.0 keeps the forward bit-for-bit unchanged; flattening changes it
+    am = torch.ones(2, 8)
+    x = torch.randn(2, 8, h)
+    mod.eval()
+    with torch.no_grad():
+        o1 = mod(hidden_states=x, attention_mask=am)["logits"]
+        cfg.router_temp = 1.0
+        o2 = mod(hidden_states=x, attention_mask=am)["logits"]
+        assert torch.equal(o1, o2), "router_temp=1.0 must be bit-for-bit identity"
+        cfg.router_temp = 2.5
+        o3 = mod(hidden_states=x, attention_mask=am)["logits"]
+        assert not torch.equal(o1, o3), "a flattening temperature must change routing"
+        cfg.router_temp = 1.0
+    # peaked start -> calibration lifts mean k to the target
+    mod.joint_router.net.weight.data *= 16.0
+    batches = [{"hidden_states": torch.randn(2, 16, h),
+                "attention_mask": torch.ones(2, 16)} for _ in range(3)]
+    info = mod.calibrate_router_temp(batches, target_k=6)
+    assert info, "moe calibration should return info"
+    assert info["k_before"] < 4.5, f"peaked start expected, got k0 {info['k_before']}"
+    assert abs(info["k_after"] - 6.0) <= 0.5, info
+    assert cfg.router_temp > 1.0, info
+    # persistence: config roundtrip keeps the calibrated temperature
+    rt = float(cfg.router_temp)
+    rt2 = SpeakerConfig(**{k: v for k, v in cfg.to_dict().items()
+                           if k != "gated_layers"}).router_temp
+    assert rt2 == rt, (rt, rt2)
+    print(f"[PASS] router temp calibration (moe) temp {rt:.3f} "
+          f"k0 {info['k_before']:.1f} -> {info['k_after']:.1f} (target 6)")
+
+
 def test_weighted_residual_onehot():
     """moe: under one-hot routing only the selected gated layer executes and w=1 (full
     residual), the rest stay identity; soft weight mixing is correct."""
@@ -582,6 +628,7 @@ if __name__ == "__main__":
     test_select_top_p()
     test_budget_threshold()
     test_budget_moe()
+    test_router_temp_calib()
     test_weighted_residual_onehot()
     test_sparse_cache_threshold()
     test_sparse_cache_moe()

@@ -280,6 +280,7 @@ class SpeakerModelWrapper(nn.Module):
         self._ta_start = float(mod_config.temp_affinity)
         self._g_start = float(mod_config.gumbel_scale)
         self.route: Optional[RouteDecision] = None  # moe: joint routing of the current forward (written by the entry layer)
+        self._calib_capture = None  # moe router-temp calibration: list collecting (entry hidden, valid) per batch
         self._patch()
         if self.mod_config.gate_mode == "moe":
             n_gated = len(self.mod_config.gated_layers)
@@ -348,10 +349,13 @@ class SpeakerModelWrapper(nn.Module):
         if self.training and float(cfg.gumbel_scale) > 0:
             u = torch.rand_like(logits).clamp_(1e-6, 1.0 - 1e-6)
             logits = logits + (-torch.log(-torch.log(u))) * float(cfg.gumbel_scale)
-        Ta = max(float(cfg.temp_affinity), 0.05)
+        Ta = max(float(cfg.temp_affinity), 0.05) * float(getattr(cfg, "router_temp", 1.0))
         valid = None
         if attention_mask is not None and attention_mask.dim() == 2:
             valid = attention_mask.to(torch.float32)
+        cap = self._calib_capture
+        if cap is not None:
+            cap.append((h.detach(), None if valid is None else valid.detach()))
         route = select_and_weight(logits / Ta, select_mode=cfg.select_mode,
                                   top_p=cfg.top_p, top_k=cfg.top_k,
                                   min_layers=cfg.min_layers, kmax=cfg.kmax,
@@ -617,6 +621,77 @@ class SpeakerModelWrapper(nn.Module):
             out[k] = float(w.tau.detach())
         self.get_layer_usage()  # clear usage accumulated during calibration
         return out
+
+    def calibrate_router_temp(self, batches, target_k: Optional[int] = None):
+        """moe only: init-time JointRouter logit-temperature calibration so the initial top-p
+        mean k starts near target_k (threshold returns {}). Mirror of calibrate_tau's
+        philosophy: enter the budget-ramp window from a near-dense routing distribution.
+        The temperature is persisted in SpeakerConfig (mod_config.json), not in state_dict —
+        gate.pt key sets stay unchanged; 1.0 (default / legacy ckpts) = identity."""
+        if self.mod_config.gate_mode != "moe" or self.joint_router is None:
+            return {}
+        cfg = self.mod_config
+        G = len(cfg.gated_layers)
+        lo_k = max(int(cfg.min_layers), 1)
+        hi_k = min(int(cfg.kmax), G)
+        if target_k is None:
+            target_k = max(lo_k, min(hi_k, round(0.6 * G)))
+        target_k = int(max(lo_k, min(hi_k, int(target_k))))
+        was_training = self.training
+        self.eval()
+        self._calib_capture = []
+        with torch.no_grad():
+            for b in batches:
+                self(**b)
+            captured = self._calib_capture
+            self._calib_capture = None
+            if not captured:
+                if was_training:
+                    self.train()
+                return {}
+            h = torch.cat([x.reshape(-1, x.shape[-1]) for x, _ in captured], dim=0)
+            v = torch.cat([w.reshape(-1) for _, w in captured], dim=0) \
+                if captured[0][1] is not None else None
+            if v is None:
+                v = torch.ones(h.shape[0], device=h.device)
+            keep = v > 0
+            h, v = h[keep], v[keep]
+            if h.shape[0] > 8192:  # cap calibration tokens for speed
+                idx = torch.randperm(h.shape[0], device=h.device)[:8192]
+                h, v = h[idx], v[idx]
+            raw = self.joint_router(h)  # [N,G] fp32, no gumbel (eval)
+            Ta0 = max(float(cfg.temp_affinity), 0.05)
+
+            def mean_k(t: float) -> float:
+                rd = select_and_weight(raw / (Ta0 * t), select_mode=cfg.select_mode,
+                                       top_p=cfg.top_p, top_k=cfg.top_k,
+                                       min_layers=cfg.min_layers, kmax=cfg.kmax,
+                                       count_temp=cfg.count_temp, valid=v)
+                return float((rd.k * v).sum() / v.sum().clamp_min(1.0))
+
+            k_before = mean_k(1.0)
+            t_best = 1.0
+            if k_before < target_k - 0.25:
+                # flatten the distribution (t > 1) until mean k reaches the target;
+                # only flatten — a start that is already dense enough stays untouched
+                lo, hi = 0.0, 8.0  # bisection on log2(t)
+                if mean_k(2.0 ** hi) < target_k - 0.25:
+                    t_best = 2.0 ** hi  # best effort at the cap
+                else:
+                    for _ in range(40):
+                        mid = (lo + hi) / 2
+                        if mean_k(2.0 ** mid) < target_k:
+                            lo = mid
+                        else:
+                            hi = mid
+                    t_best = 2.0 ** ((lo + hi) / 2)
+                cfg.router_temp = float(t_best)
+            k_after = mean_k(t_best)
+        if was_training:
+            self.train()
+        self.get_layer_usage()  # clear usage accumulated during calibration
+        return {"router_temp": float(t_best), "k_before": k_before,
+                "k_after": k_after, "target_k": target_k}
 
     # ----- Placement -----
 

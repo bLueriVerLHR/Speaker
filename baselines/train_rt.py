@@ -19,6 +19,7 @@ Mechanisms (layer forward/patch/stats/eval) live in baselines/lib.py; this file 
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -48,16 +49,23 @@ def parse_args():
     p.add_argument("--eval_samples", type=int, default=100)
     p.add_argument("--granularity", default="attn_sequence",
                    help="paper default: Attention+sequence level (§5.2); block/mlp/token also explored in the paper")
-    p.add_argument("--rt_target", type=float, default=0.5, help="target execution rate s (paper main experiments 50%)")
+    p.add_argument("--rt_target", type=float, default=0.5, help="target execution rate s (paper main experiments 50%%)")
     p.add_argument("--rt_scale", type=float, default=0.01,
                    help="capacity loss weight λ (middle of the paper grid {0,0.1,0.01,0.001}; official default 0 = unconstrained)")
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_dir", default="/tmp/rt_baseline")
+    p.add_argument("--seed", type=int, default=None,
+                   help="random seed (unset by default, preserving legacy behavior)")
+    p.add_argument("--patience", type=int, default=3,
+                   help="StopOnPlateau patience (enlarge to guarantee running to --max_steps)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     tok = build_tok(args.model_id)
     model = build_model(args.model_id, device)
@@ -98,7 +106,7 @@ def main():
     opt = torch.optim.AdamW([{"params": routers, "lr": args.lr}], weight_decay=0.0)
     dl = DataLoader(full, batch_size=1, shuffle=True, collate_fn=coll_fn)
     os.makedirs(args.save_dir, exist_ok=True)
-    stopper = StopOnPlateau(max_steps=args.max_steps)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
+    stopper = StopOnPlateau(max_steps=args.max_steps, patience=args.patience)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
     stop_subset = eval_texts[:40]  # subset for plateau checks (saves time); final eval still uses the full set
     step, ema_lm, ema_cap = 0, None, None
     t0 = time.time()

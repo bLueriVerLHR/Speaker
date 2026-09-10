@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -68,6 +69,10 @@ def parse_args():
                    help="BCE auxiliary loss weight (paper §3.5 method 1; coefficient value not given in the paper)")
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_dir", default="/tmp/modd_baseline")
+    p.add_argument("--seed", type=int, default=None,
+                   help="random seed (unset by default, preserving legacy behavior)")
+    p.add_argument("--patience", type=int, default=3,
+                   help="StopOnPlateau patience (enlarge to guarantee running to --max_steps)")
     p.add_argument("--use_lora", default=True, action=argparse.BooleanOptionalAction,
                    help="add LoRA to the base and jointly train it with the router (the paper is full-parameter; 7B full-parameter "
                         "does not fit in 24GB, hardware adaptation, same rank/targets spec as ours)")
@@ -79,6 +84,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     tok = build_tok(args.model_id)
     model = build_model(args.model_id, device)
@@ -119,13 +127,17 @@ def main():
                          if any(g in nm for g in GATE_KEYS) and p.requires_grad)
     print(f"trainable {sum(p.numel() for p in trainable) / 1e6:.1f}M params "
           f"(lora={args.use_lora}, routers train {n_router_train})", flush=True)
-    if not args.use_lora and hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()  # off under LoRA (frozen-embed backward pitfall, same as ours)
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if args.use_lora:
+            # r7 OOM fix: bs2 x len1024 x 7B LoRA needs checkpointing; the frozen-embed backward
+            # pitfall is solved by enable_input_require_grads (same as finetune/train.py since r5)
+            model.enable_input_require_grads()
 
     opt = torch.optim.AdamW(groups, weight_decay=0.01)
     dl = DataLoader(full, batch_size=args.batch_size, shuffle=True, collate_fn=coll_fn)
     os.makedirs(args.save_dir, exist_ok=True)
-    stopper = StopOnPlateau(max_steps=args.max_steps)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
+    stopper = StopOnPlateau(max_steps=args.max_steps, patience=args.patience)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
     stop_subset = eval_texts[:40]  # subset for plateau checks (saves time); final eval still uses the full set
     step, ema_lm, ema_k = 0, None, None
     t0 = time.time()
