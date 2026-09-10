@@ -22,8 +22,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from speaker import SpeakerConfig, convert_to_speaker
-from speaker.checkpoint import load_gate
+from baselines.assemble import assemble
 from data.sft import SFTDataset, make_collate
 from speaker.evaluate import eval_heldout
 from baselines.lib import (  # noqa: E402
@@ -75,17 +74,6 @@ def load_base(model_id, device):
     return m
 
 
-def wrap_lora(m, cfg_json, args):
-    """Wrap peft with the LoRA spec from the ckpt config (same params as training, consistent key layout); falls back to CLI args when missing."""
-    from peft import LoraConfig, TaskType, get_peft_model
-    targets = cfg_json.get("lora_targets")
-    return get_peft_model(m, LoraConfig(
-        r=cfg_json.get("lora_rank", args.lora_rank),
-        lora_alpha=cfg_json.get("lora_alpha", args.lora_alpha),
-        target_modules=targets or [t.strip() for t in args.lora_targets.split(",") if t.strip()],
-        lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM))
-
-
 def main():
     args = parse_args()
     device = torch.device(args.device)
@@ -116,156 +104,82 @@ def main():
         torch.cuda.empty_cache()
 
     for ckpt in args.dense_ft:
-        with open(os.path.join(ckpt, "denseft_config.json")) as f:
-            dc = json.load(f)
-        m2 = AutoModelForCausalLM.from_pretrained(
-            args.model_id, dtype=torch.bfloat16, device_map=None,
-            trust_remote_code=True, low_cpu_mem_usage=True)
-        if dc.get("use_lora", True):
-            m2 = wrap_lora(m2, dc, args)
-        sd = torch.load(os.path.join(ckpt, "lora.pt"), map_location="cpu")
-        missing, unexp = m2.load_state_dict(sd, strict=False)
-        m2.to(device)
-        n_lora_dropped = sum(1 for k in missing if "lora" in k)
-        print(f"[{os.path.basename(ckpt)}] lora.pt missing {len(missing)} "
-              f"(lora {n_lora_dropped}) unexpected {len(unexp)}", flush=True)
-        assert n_lora_dropped == 0, "lora weights did not match any keys (rank/targets inconsistent with training?)"
+        asm = assemble(ckpt, args.model_id, args, device)
+        m2, dc = asm.model, asm.cfg
         r = eval_heldout(m2, texts, coll, args.batch_size, valid_mode=args.valid_mode)
         k_fix = dc.get("n_layers", m2.config.num_hidden_layers)
-        print(f"[{os.path.basename(ckpt)}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
+        print(f"[{asm.name}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
               f"(Δ {r['loss'] - d['loss']:+.3f}/{r['acc'] - d['acc']:+.3f}) "
               f"k {k_fix} (no sparsity)", flush=True)
-        rows.append({"name": f"denseft:{os.path.basename(ckpt)}", "loss": r["loss"],
+        rows.append({"name": asm.name, "loss": r["loss"],
                      "acc": r["acc"], "dloss": r["loss"] - d["loss"],
                      "dacc": r["acc"] - d["acc"], "mean_k": float(k_fix), "std_k": 0.0})
-        del m2
+        del m2, asm
         if device.type == "cuda":
             gc.collect()
             torch.cuda.empty_cache()
 
     for ckpt in args.ours:
-        # full-parameter joint-training ckpts (--save_full) ship their own full base (config.json), prefer loading from the ckpt
-        base_src = ckpt if os.path.exists(os.path.join(ckpt, "config.json")) else args.model_id
-        m2 = AutoModelForCausalLM.from_pretrained(
-            base_src, dtype=torch.bfloat16, device_map=None,
-            trust_remote_code=True, low_cpu_mem_usage=True)
-        if args.use_lora:
-            from peft import LoraConfig, TaskType, get_peft_model
-            m2 = get_peft_model(m2, LoraConfig(
-                r=args.lora_rank, lora_alpha=args.lora_alpha,
-                target_modules=[t.strip() for t in args.lora_targets.split(",") if t.strip()],
-                lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM))
-        cfg = SpeakerConfig.from_json(os.path.join(ckpt, "mod_config.json"))
-        mod = convert_to_speaker(m2, cfg).to(device)
-        missing, unexp = load_gate(mod, ckpt)
-        print(f"[{os.path.basename(ckpt)}] gate.pt missing {len(missing)} "
-              f"unexpected {len(unexp)}", flush=True)
-        mod.set_skip_mode("hard")
+        asm = assemble(ckpt, args.model_id, args, device)  # hard skip mode
+        mod = asm.model
         r = eval_heldout(mod, texts, coll, args.batch_size, valid_mode=args.valid_mode)
-        print(f"[{os.path.basename(ckpt)}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
+        print(f"[{asm.name}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
               f"(Δ {r['loss'] - d['loss']:+.3f}/{r['acc'] - d['acc']:+.3f}) "
               f"k {r['mean_k']:.1f}±{r['std_k']:.1f}", flush=True)
-        rows.append({"name": f"ours:{os.path.basename(ckpt)}", "loss": r["loss"],
+        rows.append({"name": asm.name, "loss": r["loss"],
                      "acc": r["acc"], "dloss": r["loss"] - d["loss"],
                      "dacc": r["acc"] - d["acc"], "mean_k": r["mean_k"],
                      "std_k": r["std_k"], "quartile_k": r["quartile_k"]})
-        del mod, m2
+        del mod, asm
         if device.type == "cuda":
             gc.collect()
             torch.cuda.empty_cache()
 
     for ckpt in args.modd:
-        with open(os.path.join(ckpt, "modd_config.json")) as f:
-            mc = json.load(f)
-        # joint-training ckpts ship their own full base (config.json), prefer loading from the ckpt
-        base_src = ckpt if os.path.exists(os.path.join(ckpt, "config.json")) else args.model_id
-        m2 = AutoModelForCausalLM.from_pretrained(
-            base_src, dtype=torch.bfloat16, device_map=None,
-            trust_remote_code=True, low_cpu_mem_usage=True)
-        routed = patch_model_modd(m2, mc["is_routed"], capacity=mc.get("capacity", 0.125))
-        if mc.get("use_lora"):
-            m2 = wrap_lora(m2, mc, args)  # same order as training (patch→peft), consistent key layout
-        sd = torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu")
-        missing, unexp = m2.load_state_dict(sd, strict=False)
-        m2.to(device)
-        n_drop = sum(1 for k in missing if "lora" in k or "router" in k)
-        assert n_drop == 0, f"[{ckpt}] routers.pt keys did not match (LoRA spec inconsistent with training?)"
-        print(f"[{os.path.basename(ckpt)}] routers.pt missing {len(missing)} "
-              f"unexpected {len(unexp)} (base from {os.path.basename(base_src)})", flush=True)
-        n_dense = len(mc["is_routed"]) - sum(mc["is_routed"])
+        asm = assemble(ckpt, args.model_id, args, device)
+        m2, routed, n_dense = asm.model, asm.routed, asm.n_dense
         r = eval_heldout_modd(m2, routed, n_dense, texts, coll, args.batch_size)
         print(f"[{os.path.basename(ckpt)}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
               f"(Δ {r['loss'] - d['loss']:+.3f}/{r['acc'] - d['acc']:+.3f}) "
               f"k {r['mean_k']:.1f}±{r['std_k']:.1f}", flush=True)
-        rows.append({"name": f"modd:{os.path.basename(ckpt)}", "loss": r["loss"],
+        rows.append({"name": asm.name, "loss": r["loss"],
                      "acc": r["acc"], "dloss": r["loss"] - d["loss"],
                      "dacc": r["acc"] - d["acc"], "mean_k": r["mean_k"],
                      "std_k": r["std_k"]})
-        del m2
+        del m2, asm
         if device.type == "cuda":
             gc.collect()
             torch.cuda.empty_cache()
 
     for ckpt in args.mdf:
-        with open(os.path.join(ckpt, "mdf_config.json")) as f:
-            mc = json.load(f)
-        # joint-training ckpts ship their own full base (config.json), prefer loading from the ckpt
-        base_src = ckpt if os.path.exists(os.path.join(ckpt, "config.json")) else args.model_id
-        m2 = AutoModelForCausalLM.from_pretrained(
-            base_src, dtype=torch.bfloat16, device_map=None,
-            trust_remote_code=True, low_cpu_mem_usage=True)
-        routed = patch_model_mdf(m2, mc["is_routed"], p=mc.get("p", 0.5))
-        if mc.get("use_lora"):
-            m2 = wrap_lora(m2, mc, args)  # same order as training (patch→peft), consistent key layout
-        sd = torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu")
-        missing, unexp = m2.load_state_dict(sd, strict=False)
-        m2.to(device)
-        n_drop = sum(1 for k in missing if "lora" in k or "router" in k)
-        assert n_drop == 0, f"[{ckpt}] routers.pt keys did not match (LoRA spec inconsistent with training?)"
-        print(f"[{os.path.basename(ckpt)}] routers.pt missing {len(missing)} "
-              f"unexpected {len(unexp)} (base from {os.path.basename(base_src)})", flush=True)
-        n_dense = len(mc["is_routed"]) - sum(mc["is_routed"])
+        asm = assemble(ckpt, args.model_id, args, device)
+        m2, routed, n_dense = asm.model, asm.routed, asm.n_dense
         r = eval_heldout_mdf(m2, routed, n_dense, texts, coll, args.batch_size)
         print(f"[{os.path.basename(ckpt)}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
               f"(Δ {r['loss'] - d['loss']:+.3f}/{r['acc'] - d['acc']:+.3f}) "
               f"k {r['mean_k']:.1f}±{r['std_k']:.1f}", flush=True)
-        rows.append({"name": f"mdf:{os.path.basename(ckpt)}", "loss": r["loss"],
+        rows.append({"name": asm.name, "loss": r["loss"],
                      "acc": r["acc"], "dloss": r["loss"] - d["loss"],
                      "dacc": r["acc"] - d["acc"], "mean_k": r["mean_k"],
                      "std_k": r["std_k"]})
-        del m2
+        del m2, asm
         if device.type == "cuda":
             gc.collect()
             torch.cuda.empty_cache()
 
     for ckpt in args.rt:
-        with open(os.path.join(ckpt, "rt_config.json")) as f:
-            rc = json.load(f)
-        m2 = AutoModelForCausalLM.from_pretrained(
-            args.model_id, dtype=torch.bfloat16, device_map=None,
-            trust_remote_code=True, low_cpu_mem_usage=True)
-        gated = patch_model_rt(m2, rc["is_mod"], rc.get("granularity", "block_token"),
-                               rc.get("threshold", 0.5), rc.get("target"),
-                               rc.get("scale", 0.0))
-        sd = torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu")
-        missing, unexp = m2.load_state_dict(sd, strict=False)
-        m2.to(device)
-        n_drop = sum(1 for k in missing if "lora" in k or "router" in k)
-        assert n_drop == 0, f"[{ckpt}] routers.pt keys did not match (LoRA spec inconsistent with training?)"
-        print(f"[{os.path.basename(ckpt)}] routers.pt missing {len(missing)} "
-              f"unexpected {len(unexp)}", flush=True)
-        n_mod = sum(rc["is_mod"])
-        n_always = len(rc["is_mod"]) - n_mod
+        asm = assemble(ckpt, args.model_id, args, device)
+        m2, gated, n_always = asm.model, asm.gated, asm.n_always
         r = eval_heldout_rt(m2, gated, texts, coll, args.batch_size, n_always=n_always)
-        k_est = n_always + (r["exec_rate"] or 0) * n_mod
+        k_est = n_always + (r["exec_rate"] or 0) * asm.n_mod
         print(f"[{os.path.basename(ckpt)}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
               f"(Δ {r['loss'] - d['loss']:+.3f}/{r['acc'] - d['acc']:+.3f}) "
               f"exec {r['exec_rate']:.2f} k_est {k_est:.1f}", flush=True)
-        rows.append({"name": f"rt:{os.path.basename(ckpt)}", "loss": r["loss"],
+        rows.append({"name": asm.name, "loss": r["loss"],
                      "acc": r["acc"], "dloss": r["loss"] - d["loss"],
                      "dacc": r["acc"] - d["acc"], "exec_rate": r["exec_rate"],
                      "k_est": k_est})
-        del m2
+        del m2, asm
         if device.type == "cuda":
             gc.collect()
             torch.cuda.empty_cache()

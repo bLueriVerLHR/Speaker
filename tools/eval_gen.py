@@ -14,7 +14,8 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from speaker import SpeakerConfig, convert_to_speaker
-from baselines.lib import patch_model_modd, patch_model_mdf, patch_model_rt
+from baselines.assemble import assemble  # noqa: E402
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -155,96 +156,30 @@ def load_base(model_id, device):
 
 
 def load_ours(args, tok, device, ckpt):
-    m2 = load_base(args.model_id, device)
-    if args.use_lora:
-        from peft import LoraConfig, TaskType, get_peft_model
-        m2 = get_peft_model(m2, LoraConfig(
-            r=args.lora_rank, lora_alpha=args.lora_alpha,
-            target_modules=[t.strip() for t in args.lora_targets.split(",") if t.strip()],
-            lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM))
-    cfg = SpeakerConfig.from_json(f"{ckpt}/mod_config.json")
-    mod = convert_to_speaker(m2, cfg)
-    sd = torch.load(f"{ckpt}/gate.pt", map_location="cpu")
-    missing, unexp = mod.load_state_dict(sd, strict=False)
-    print(f"gate.pt loaded, missing {len(missing)} unexpected {len(unexp)}", flush=True)
+    asm = assemble(ckpt, args.model_id, args, device)
+    mod = asm.model
     if args.resident.strip():
         resident = mod.set_placement([int(x) for x in args.resident.split(",") if x.strip() != ""],
                                      gpu_device=device, cpu_device="cpu")
         print(f"placement resident {resident} gpu-GB {mod.resident_gb('cuda'):.2f} "
               f"(full {sum(p.numel()*p.element_size() for p in mod.parameters())/1e9:.2f})", flush=True)
-    return mod.to(device)
-
-
-def wrap_lora(m, cfg_json, args):
-    """Wrap peft per the LoRA spec in the ckpt config (same params as training); falls back to
-    CLI args when absent."""
-    from peft import LoraConfig, TaskType, get_peft_model
-    targets = cfg_json.get("lora_targets")
-    return get_peft_model(m, LoraConfig(
-        r=cfg_json.get("lora_rank", args.lora_rank),
-        lora_alpha=cfg_json.get("lora_alpha", args.lora_alpha),
-        target_modules=targets or [t.strip() for t in args.lora_targets.split(",") if t.strip()],
-        lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM))
-
-
-def _check_loaded(ckpt, missing, unexp):
-    bad = [k for k in missing if "lora" in k or "router" in k]
-    assert not bad, f"[{ckpt}] routers.pt keys mismatch (LoRA spec differs from training?)"
-    print(f"routers.pt missing {len(missing)} base keys, unexpected {len(unexp)}", flush=True)
+    return mod
 
 
 def load_modd(args, device, ckpt):
-    with open(os.path.join(ckpt, "modd_config.json")) as f:
-        mc = json.load(f)
-    base_src = ckpt if os.path.exists(os.path.join(ckpt, "config.json")) else args.model_id
-    m = load_base(base_src, device)
-    patch_model_modd(m, mc["is_routed"], capacity=mc.get("capacity", 0.125))
-    if mc.get("use_lora"):
-        m = wrap_lora(m, mc, args)  # same order as training (patch→peft), key layout consistent
-    missing, unexp = m.load_state_dict(
-        torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu"), strict=False)
-    _check_loaded(ckpt, missing, unexp)
-    return m.to(device)
+    return assemble(ckpt, args.model_id, args, device).model
 
 
 def load_mdf(args, device, ckpt):
-    with open(os.path.join(ckpt, "mdf_config.json")) as f:
-        mc = json.load(f)
-    base_src = ckpt if os.path.exists(os.path.join(ckpt, "config.json")) else args.model_id
-    m = load_base(base_src, device)
-    patch_model_mdf(m, mc["is_routed"], p=mc.get("p", 0.5))
-    if mc.get("use_lora"):
-        m = wrap_lora(m, mc, args)  # same order as training (patch→peft), key layout consistent
-    missing, unexp = m.load_state_dict(
-        torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu"), strict=False)
-    _check_loaded(ckpt, missing, unexp)
-    return m.to(device)
+    return assemble(ckpt, args.model_id, args, device).model
 
 
 def load_dense_ft(args, device, ckpt):
-    with open(os.path.join(ckpt, "denseft_config.json")) as f:
-        dc = json.load(f)
-    m = load_base(args.model_id, device)
-    if dc.get("use_lora", True):
-        m = wrap_lora(m, dc, args)
-    sd = torch.load(os.path.join(ckpt, "lora.pt"), map_location="cpu")
-    missing, unexp = m.load_state_dict(sd, strict=False)
-    bad = [k for k in missing if "lora" in k]
-    assert not bad, f"[{ckpt}] lora.pt keys mismatch"
-    print(f"lora.pt loaded, missing {len(missing)} base keys, unexpected {len(unexp)}",
-          flush=True)
-    return m.to(device)
+    return assemble(ckpt, args.model_id, args, device).model
 
 
 def load_rt(args, device, ckpt):
-    with open(os.path.join(ckpt, "rt_config.json")) as f:
-        rc = json.load(f)
-    m = load_base(args.model_id, device)
-    patch_model_rt(m, rc["is_mod"], rc.get("granularity", "block_token"),
-                   rc.get("threshold", 0.5), rc.get("target"), rc.get("scale", 0.0))
-    m.load_state_dict(torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu"),
-                      strict=False)
-    return m.to(device)
+    return assemble(ckpt, args.model_id, args, device).model
 
 
 def plot_gen(summary, png_path):
