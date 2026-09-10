@@ -277,7 +277,10 @@ def main():
         print(f"{r['name']:28s} {r['loss']:6.3f} {r['acc']:6.3f} "
               f"{r['dloss']:+7.3f} {r['dacc']:+7.3f} {kk}", flush=True)
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump({"dense": {"loss": d["loss"], "acc": d["acc"]}, "rows": rows}, f,
+        json.dump({"meta": {"model_id": args.model_id, "offset": args.offset, "n": args.n,
+                            "max_len": args.max_len, "use_chat": args.use_chat,
+                            "valid_mode": args.valid_mode, "batch_size": args.batch_size},
+                   "dense": {"loss": d["loss"], "acc": d["acc"]}, "rows": rows}, f,
                    indent=1, ensure_ascii=False)
     print(f"saved {args.out}", flush=True)
     try:
