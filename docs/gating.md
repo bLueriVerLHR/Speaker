@@ -7,6 +7,16 @@ enters the loss*. Checkpoints of one mode do not load in the other (`gate.pt` ke
 sets are disjoint); `mod_config.json` records the mode, and a missing `gate_mode`
 field (old checkpoints) is inferred as `threshold`.
 
+**Scheme names (and CLI aliases)**:
+
+| Scheme | Canonical `gate_mode` | CLI alias | Decides |
+|---|---|---|---|
+| **Speaker** | `threshold` | `--gate_mode speaker` | each layer independently (per-layer gate) |
+| **MoL** (Mixture of Layers) | `moe` | `--gate_mode mol` | one joint router for the whole gated region |
+
+Aliases are normalized to the canonical values in `SpeakerConfig.__post_init__`,
+so checkpoints stay bit-compatible with the historical `threshold`/`moe` formats.
+
 ---
 
 ## moe — joint routing over layers (default mainline)

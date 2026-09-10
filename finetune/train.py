@@ -65,7 +65,7 @@ def parse_args():
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--router_lr", type=float, default=1e-4)
     p.add_argument("--kmax", type=int, default=10)
-    p.add_argument("--gate_mode", default="moe", choices=["moe", "threshold"],
+    p.add_argument("--gate_mode", default="moe", choices=["moe", "mol", "threshold", "speaker"], metavar="SCHEME",
                    help="moe=hierarchical MoE joint routing (default mainline) / threshold=legacy per-layer threshold gating; "
                         "on resume, the ckpt's mod_config.json takes precedence")
     p.add_argument("--select_mode", default="topp", choices=["topp", "topk"],

@@ -45,6 +45,9 @@ def parse_args():
     p.add_argument("--max_len", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--use_chat", default=True, action=argparse.BooleanOptionalAction)
+    p.add_argument("--valid_mode", default="labels", choices=["labels", "attention_mask"],
+                   help="token accounting for loss/acc: 'labels' = assistant tokens only (SFT standard, "
+                        "unified across all families); 'attention_mask' = all tokens (legacy)")
     p.add_argument("--mask_user", default=True, action=argparse.BooleanOptionalAction)
     p.add_argument("--ours", action="append", default=[], help="ours ckpt directories, repeatable")
     p.add_argument("--dense_ft", action="append", default=[],
@@ -103,7 +106,7 @@ def main():
 
     dense = load_base(args.model_id, device)
     coll = make_collate(tok, device, args.max_len, args.use_chat, args.mask_user)
-    d = eval_heldout(dense, texts, coll, args.batch_size)
+    d = eval_heldout(dense, texts, coll, args.batch_size, valid_mode=args.valid_mode)
     print(f"[dense] loss {d['loss']:.3f} acc {d['acc']:.3f}", flush=True)
     rows.append({"name": "dense", "loss": d["loss"], "acc": d["acc"]})
     del dense
@@ -126,7 +129,7 @@ def main():
         print(f"[{os.path.basename(ckpt)}] lora.pt missing {len(missing)} "
               f"(lora {n_lora_dropped}) unexpected {len(unexp)}", flush=True)
         assert n_lora_dropped == 0, "lora weights did not match any keys (rank/targets inconsistent with training?)"
-        r = eval_heldout(m2, texts, coll, args.batch_size)
+        r = eval_heldout(m2, texts, coll, args.batch_size, valid_mode=args.valid_mode)
         k_fix = dc.get("n_layers", m2.config.num_hidden_layers)
         print(f"[{os.path.basename(ckpt)}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
               f"(Δ {r['loss'] - d['loss']:+.3f}/{r['acc'] - d['acc']:+.3f}) "
@@ -157,7 +160,7 @@ def main():
         print(f"[{os.path.basename(ckpt)}] gate.pt missing {len(missing)} "
               f"unexpected {len(unexp)}", flush=True)
         mod.set_skip_mode("hard")
-        r = eval_heldout(mod, texts, coll, args.batch_size)
+        r = eval_heldout(mod, texts, coll, args.batch_size, valid_mode=args.valid_mode)
         print(f"[{os.path.basename(ckpt)}] loss {r['loss']:.3f} acc {r['acc']:.3f} "
               f"(Δ {r['loss'] - d['loss']:+.3f}/{r['acc'] - d['acc']:+.3f}) "
               f"k {r['mean_k']:.1f}±{r['std_k']:.1f}", flush=True)

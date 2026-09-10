@@ -85,7 +85,7 @@ def parse_args():
                    help="explicit list of fixed layers (comma-separated), overrides shared_head/tail")
     # Gating/budget (same Speaker mechanism as finetune, gate_mode dual scheme)
     p.add_argument("--kmax", type=int, default=10)
-    p.add_argument("--gate_mode", default="moe", choices=["moe", "threshold"],
+    p.add_argument("--gate_mode", default="moe", choices=["moe", "mol", "threshold", "speaker"], metavar="SCHEME",
                    help="moe=hierarchical MoE joint routing (default mainline) / threshold=legacy per-layer threshold gating")
     p.add_argument("--select_mode", default="topp", choices=["topp", "topk"])
     p.add_argument("--top_p", type=float, default=0.9)

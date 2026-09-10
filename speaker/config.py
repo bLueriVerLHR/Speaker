@@ -15,6 +15,9 @@ The shared-layer idea is identical across both schemes: always_on fixed layers (
 promoted when load >= 90%~95%) + the profiling pipeline.
 from_json: unknown keys are dropped; an old ckpt's mod_config.json without a gate_mode field is
 inferred as threshold (legacy semantics unchanged); new ckpts write gate_mode explicitly.
+Naming (0910 pivot): the per-layer scheme is called "Speaker" (CLI alias --gate_mode speaker),
+the joint-router scheme "MoL / Mixture of Layers" (CLI alias mol); both map onto the legacy
+canonical values threshold/moe before anything is stored, so ckpt compatibility is unchanged.
 """
 from __future__ import annotations
 
@@ -79,6 +82,12 @@ class SpeakerConfig:
     skip_mode: str = "soft"  # soft for training (hard selection in forward), hard for deployment (layer skipping saves memory)
 
     def __post_init__(self):
+        # public aliases (0910 pivot): speaker -> threshold, mol -> moe; canonical values are
+        # normalized here so ckpts always store one of threshold/moe (bit-compatible with history)
+        if self.gate_mode == "speaker":
+            self.gate_mode = "threshold"
+        elif self.gate_mode == "mol":
+            self.gate_mode = "moe"
         if self.always_on_layers is None:
             # None = unset: first m + last n always resident, middle optional (m/n
             # configurable; the default 2/2 is the ablation-validated configuration).

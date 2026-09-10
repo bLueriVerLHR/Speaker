@@ -11,6 +11,31 @@ how the fixed-layer set is born.
   include middle layers (observed: L0/L27 self-promote at ~0.99/0.97; a mid-stack
   L2/L21/L26 also cleared 92% in one profile).
 
+Track B *is* the **post-training repair** pipeline for a pretrained checkpoint:
+run a few rounds to identify the load profile, promote the hot layers to fixed,
+then continue finetuning over shared + gated layers (the distribution is already
+settled by then). The same recipe applies to both schemes (Speaker / MoL) and is
+the vehicle for accuracy recovery, repetition control (`--ul_mode rollout`), and
+budget re-targeting (`--acc_target`).
+
+## Evaluation yardsticks (read before comparing numbers)
+
+Three axes silently change what a number means — keep them pinned when comparing:
+
+1. **`use_chat`** — chat-template task vs plain concatenation. Training scripts
+   default to plain; `baselines/eval_compare.py` defaults to chat. On the same
+   slice and model these differ by ~0.9 nats of loss. The chat task is the
+   deployment-relevant one.
+2. **`valid_mode`** — token accounting: `labels` (assistant tokens only, SFT
+   standard) vs `attention_mask` (all tokens incl. template scaffolding, which
+   inflates accuracy). `eval_compare --valid_mode labels` is the unified default.
+3. **Skip mode (ours only)** — training-time evals run under *soft* gating;
+   external evals set `hard`. The soft→hard gap (~20pt acc in r7) is the real
+   price of sparsity; only hard-mode numbers describe deployment.
+
+Training-time numbers are for loop control (dual, plateau), not for cross-method
+tables; use `baselines/eval_compare.py` with pinned axes for reporting.
+
 ## The budget dual (price of depth)
 
 The core training objective (moe mode; threshold differs only in k accounting):
