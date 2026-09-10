@@ -48,6 +48,7 @@ def parse_args():
     p.add_argument("--lora_targets", default="q_proj,v_proj")
     p.add_argument("--resident", default="", help="GPU-resident layers, comma separated; empty = all layers on GPU. e.g. 0,1,15,16,17,19,22,23")
     p.add_argument("--out", default="/tmp/gen_eval.json")
+    p.add_argument("--no_png", action="store_true")
     return p.parse_args()
 
 def load_texts(path, offset, n):
@@ -366,7 +367,8 @@ def main():
         json.dump(summary, f, ensure_ascii=False, indent=1)
     print(f"saved {args.out}", flush=True)
     try:
-        print(f"saved {plot_gen(summary, os.path.splitext(args.out)[0] + '.png')}", flush=True)
+        if not args.no_png:
+            print(f"saved {plot_gen(summary, os.path.splitext(args.out)[0] + '.png')}", flush=True)
     except ImportError:
         print("matplotlib unavailable, skipping plot", flush=True)
 

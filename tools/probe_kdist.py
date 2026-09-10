@@ -57,6 +57,7 @@ def parse_args():
     p.add_argument("--gen_tokens", type=int, default=0,
                    help=">0 additionally runs a dense-vs-ours generation comparison (new tokens per prompt)")
     p.add_argument("--out", default=".logs/kdist.json")
+    p.add_argument("--no_png", action="store_true")
     return p.parse_args()
 
 
@@ -412,7 +413,7 @@ def main():
         json.dump(out, f, indent=1, ensure_ascii=False)
     print(f"saved {args.out}", flush=True)
     try:
-        png = plot(out, os.path.splitext(args.out)[0] + ".png")
+        png = None if args.no_png else plot(out, os.path.splitext(args.out)[0] + ".png")
         print(f"saved {png}", flush=True)
     except ImportError:
         print("matplotlib unavailable, skipping plot", flush=True)

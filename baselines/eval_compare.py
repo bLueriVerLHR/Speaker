@@ -64,6 +64,7 @@ def parse_args():
     p.add_argument("--lora_targets", default="q_proj,v_proj")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--out", default="/tmp/compare.json")
+    p.add_argument("--no_png", action="store_true", help="skip the per-invocation figure (consolidate via tools/plot_r7.py instead)")
     return p.parse_args()
 
 
@@ -349,6 +350,8 @@ def plot_rows(rows, dense, args):
     ax.set_xticklabels(names, rotation=20, ha="right", fontsize=9)
     ax.set_title("per-token active layers k (lower=faster)", fontsize=11)
     ax.grid(axis="y", alpha=0.3)
+    if getattr(args, "no_png", False):
+        return
     png = os.path.splitext(args.out)[0] + ".png"
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     fig.savefig(png, dpi=150)
