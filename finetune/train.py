@@ -25,12 +25,21 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from speaker import SpeakerConfig, convert_to_speaker  # noqa: E402
-from speaker.metrics import distill_kl_loss, estimate_act_mb, per_token_correct  # noqa: E402
+from speaker.metrics import distill_kl_loss, estimate_act_mb, per_token_nll  # noqa: E402
 from speaker.evaluate import ema_update, eval_heldout  # noqa: E402
+from speaker.ruler import AccRuler  # noqa: E402 (P0: one accuracy scale everywhere)
+from speaker.dual import DualController, difficulty_mult  # noqa: E402 (P0.5 dual + ed8 difficulty shaping)
+from speaker.ul import (  # noqa: E402 (P2: anti-repetition mechanism library, shared by both gate schemes)
+    gt_repeat_rate,
+    ngram_repeat_trigger,
+    rollout_rep3_probe,
+    rollout_unlikelihood,
+    unlikelihood_loss,
+)
 from speaker.converge import StopOnPlateau  # noqa: E402 (ed3 unified convergence rule)
 from speaker.log import RunLogger  # noqa: E402
 from speaker.checkpoint import clean_base_state_dict, load_gate, save_gate  # noqa: E402
@@ -65,13 +74,23 @@ def parse_args():
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--router_lr", type=float, default=1e-4)
     p.add_argument("--kmax", type=int, default=10)
-    p.add_argument("--gate_mode", default="moe", choices=["moe", "threshold"],
+    p.add_argument("--decode_rep_penalty", type=float, default=None,
+                   help="bake a validated decode recipe into mod_config.json (ed9/C): "
+                        "repetition_penalty shipped with the ckpt; None = legacy (no recipe). "
+                        "Validated 0911: 1.15 (128tok/temp0.7 rep 0.448->0.056)")
+    p.add_argument("--decode_no_repeat_ngram", type=int, default=None,
+                   help="bake no_repeat_ngram_size into mod_config.json; None = legacy. "
+                        "Validated 0911: 3 (near-free: dense ROUGE 0.247->0.249)")
+    p.add_argument("--gate_mode", default="moe", choices=["moe", "mol", "threshold", "speaker"], metavar="SCHEME",
                    help="moe=hierarchical MoE joint routing (default mainline) / threshold=legacy per-layer threshold gating; "
                         "on resume, the ckpt's mod_config.json takes precedence")
     p.add_argument("--select_mode", default="topp", choices=["topp", "topk"],
                    help="moe: log p selection rule, topp=stop once the cumulative probability reaches p (adaptive k) / topk=fixed k")
     p.add_argument("--top_p", type=float, default=0.9, help="moe topp mode cumulative-probability threshold")
     p.add_argument("--top_k", type=int, default=6, help="moe topk mode fixed k")
+    p.add_argument("--weight_mode", default="pmax", choices=["pmax", "renorm"],
+                   help="moe residual weighting: pmax (w=p/p_max, gain scales with k, dual lever "
+                        "connected; ed7 fix, default) / renorm (legacy sum-to-one, collapses)")
     p.add_argument("--min_layers", type=int, default=1, help="moe: minimum number of gated layers activated per token")
     p.add_argument("--always_head", type=int, default=2, help="first m layers fixed (shared)")
     p.add_argument("--always_tail", type=int, default=2, help="last n layers fixed (shared)")
@@ -84,10 +103,26 @@ def parse_args():
                    help="threshold: initial gating threshold; negative = dense start (all gates open first, then sparsify)")
     p.add_argument("--sparsity_price", type=float, default=0.03)
     p.add_argument("--price_adapt", default=True, action=argparse.BooleanOptionalAction)
-    p.add_argument("--acc_target", type=float, default=0.55)
+    p.add_argument("--acc_target", default="auto",
+                   help="accuracy floor for the dual adjustment: 'auto' = derived from the dense baseline "
+                        "measured on the same slice/protocol (dense_acc - acc_margin; the same starting "
+                        "line whatever the base/slice/chat protocol) | float = legacy absolute floor "
+                        "(e.g. 0.55) | 'none' = dual disabled")
+    p.add_argument("--acc_margin", type=float, default=0.03,
+                   help="auto policy: allowed drop below the measured dense reference")
     p.add_argument("--price_warmup", type=int, default=100)
     p.add_argument("--budget_ramp", type=int, default=100,
-                   help="budget-loss ramp steps: task*=min(1,step/ramp); let the gating learn utility before adding sparsity pressure")
+                    help="budget-loss ramp steps: task*=min(1,step/ramp); let the gating learn utility before adding sparsity pressure")
+    p.add_argument("--diff_mode", default="off", choices=["off", "teacher"],
+                   help="difficulty-conditioned budget (ed8, bimodal separator): teacher = per-token λ "
+                        "shaped by frozen-teacher NLL tiers (easy pressed harder, hard allowed depth); "
+                        "off = legacy uniform λ (bit-identical reruns)")
+    p.add_argument("--diff_easy_nll", type=float, default=0.5,
+                   help="teacher NLL below this = easy token (p33 on the SFT slice)")
+    p.add_argument("--diff_hard_nll", type=float, default=2.5,
+                   help="teacher NLL above this = hard token (p67 on the SFT slice)")
+    p.add_argument("--diff_easy_mult", type=float, default=2.0, help="λ multiplier on easy tokens")
+    p.add_argument("--diff_hard_mult", type=float, default=0.5, help="λ multiplier on hard tokens")
     p.add_argument("--eval_samples", type=int, default=100,
                    help="number of same-distribution held-out eval samples (taken right after the training slice)")
     p.add_argument("--max_samples", type=int, default=500)
@@ -120,6 +155,12 @@ def parse_args():
                    help="threshold: number of model-aware tau calibration batches before training (0=off, uses the tau_init constant)")
     p.add_argument("--tau_spread", type=float, default=0.5,
                    help="threshold: tau calibration spread (by per-layer stability z-score)")
+    p.add_argument("--router_calib_batches", type=int, default=0,
+                   help="moe: number of router-temperature calibration batches before training (0=off/legacy); "
+                        "calibrates the JointRouter logit temperature so the initial top-p mean k starts near "
+                        "--router_start_k (near-dense healthy start, mirrors threshold's tau calibration)")
+    p.add_argument("--router_start_k", type=int, default=0,
+                   help="moe: target initial mean k for router calibration (0 = auto, ~0.6*gated)")
     p.add_argument("--resume_dir", default="",
                    help="resume from a ckpt: structure follows mod_config.json (including gate_mode), gating params are overlaid, "
                         "annealing/price are re-scheduled from the CLI (temp/gumbel/price reset to initial values)")
@@ -130,72 +171,21 @@ def parse_args():
     p.add_argument("--save_full", action="store_true",
                    help="required for the joint (full-parameter) version: additionally saves the full base (gating keys stripped) + tokenizer, "
                         "otherwise gate.pt paired with the original base will mismatch (non-LoRA only)")
-    p.add_argument("--ul_mode", default="none", choices=["none", "gt", "rollout"],
-                   help="anti-repetition regularizer (r4): gt=n-gram unlikelihood on the GT side; "
-                        "rollout=unlikelihood on self-generated rollouts (also gives the gating off-policy prefix gradients)")
+    p.add_argument("--ul_mode", default="rollout", choices=["none", "gt", "rollout"],
+                   help="anti-repetition regularizer (r4; default rollout per ed7 decision): "
+                        "gt=n-gram unlikelihood on the GT side; "
+                        "rollout=unlikelihood on self-generated rollouts (also gives the gating off-policy prefix gradients); "
+                        "none=off (legacy)")
     p.add_argument("--ul_coef", type=float, default=0.3, help="unlikelihood term weight (0=off)")
     p.add_argument("--ul_n", type=int, default=3, help="n-gram length that triggers UL")
     p.add_argument("--rollout_every", type=int, default=20,
                    help="rollout mode: self-generate a rollout every K steps")
     p.add_argument("--rollout_tokens", type=int, default=24, help="number of tokens generated per rollout")
     p.add_argument("--rollout_prompt", type=int, default=32, help="length of the real prefix taken from the batch for rollout")
+    p.add_argument("--rep_probe", default=True, action=argparse.BooleanOptionalAction,
+                   help="repetition visibility: tiny hard-greedy rollout probe at plateau beats "
+                        "(RunLogger event, trend-only; no RNG drawn, training numerics untouched)")
     return p.parse_args()
-
-
-def ngram_repeat_trigger(ids: torch.Tensor, n: int, valid: torch.Tensor) -> torch.Tensor:
-    """[B,T] bool: position t triggers when the n-gram ending at t (including x_t)
-    appeared earlier in the sequence and valid[t].
-    Trigger positions are where "repetition is forming" (n-gram-triggered variant of
-    Welleck unlikelihood);
-    positions with valid=False (padding/unsupervised segments) never trigger, but
-    their tokens still enter the context as usual."""
-    B, T = ids.shape
-    out = torch.zeros(B, T, dtype=torch.bool)
-    for b in range(B):
-        seq = ids[b].tolist()
-        seen: set = set()
-        for t in range(T):
-            if t + 1 >= n:
-                gram = tuple(seq[t + 1 - n:t + 1])
-                if valid[b, t] and gram in seen:
-                    out[b, t] = True
-                seen.add(gram)
-    return out
-
-
-def unlikelihood_loss(logits, targets, trigger) -> torch.Tensor:
-    """-log(1 - p(target)) at trigger positions (suppress the probability of repeated
-    tokens); softmax is computed only on the triggered rows to save compute.
-    logits [B,T-1,V] align with targets [B,T-1] (HF shift: logits[:,t] predicts x_{t+1})."""
-    idx = trigger.nonzero(as_tuple=False)
-    if idx.numel() == 0:
-        return logits.new_zeros(())
-    rows = logits[idx[:, 0], idx[:, 1]].float()
-    tgt = targets[idx[:, 0], idx[:, 1]]
-    p = rows.softmax(-1).gather(-1, tgt[:, None]).squeeze(-1)
-    return -(1 - p).clamp_min(1e-6).log().mean()
-
-
-def rollout_unlikelihood(mod_model, batch, args, tok, device):
-    """Scheme 2: hard greedy rollout with the current model -> trigger n-gram UL on the
-    self-generated segment.
-    Side effect: the UL forward pass with gradients gives the gating/LoRA gradients on
-    drifted prefixes (DAgger style)."""
-    prompt = batch["input_ids"][:1, :args.rollout_prompt]
-    mod_model.eval()
-    mod_model.set_skip_mode("hard")  # rollout takes the deployment path (hard layer skipping + sparse KV)
-    with torch.no_grad():
-        g = mod_model.generate(input_ids=prompt, attention_mask=torch.ones_like(prompt),
-                               max_new_tokens=args.rollout_tokens, do_sample=False,
-                               pad_token_id=tok.pad_token_id, use_cache=True)
-    mod_model.set_skip_mode("soft")
-    mod_model.train()
-    seq = g[:, :prompt.shape[1] + args.rollout_tokens]  # [1, Lp+G] (shorter if eos truncates early)
-    valid = torch.zeros_like(seq, dtype=torch.bool)
-    valid[0, prompt.shape[1]:] = True  # trigger only on the self-generated segment; the prompt segment only enters the context
-    trg = ngram_repeat_trigger(seq, args.ul_n, valid)
-    out = mod_model(input_ids=seq, attention_mask=torch.ones_like(seq))
-    return unlikelihood_loss(out.logits[:, :-1], seq[:, 1:], trg[:, 1:])
 
 
 def main():
@@ -225,14 +215,19 @@ def main():
                            args.use_chat_template, args.mask_user_tokens)
 
     dense_res = None
+    ruler = AccRuler.from_cli(args.acc_target, args.acc_margin)
     if eval_texts:
-        dense_res = eval_heldout(model, eval_texts, coll_fn)
+        dense_res = eval_heldout(model, eval_texts, coll_fn, valid_mode=ruler.mode)
         print(f"heldout dense baseline: loss {dense_res['loss']:.3f} acc {dense_res['acc']:.3f} "
               f"({len(eval_texts)} samples)", flush=True)
+    acc_floor = ruler.resolve(dense_res["acc"] if dense_res else None)
+    print(f"[ruler] {ruler.describe()}", flush=True)
 
     teacher = None
     t_device = None
-    if args.kl_coef > 0:
+    if args.kl_coef > 0 or args.diff_mode == "teacher":
+        # the frozen dense serves KL distillation and/or the difficulty oracle (ed8 tiers);
+        # one forward covers both when both are on
         t_device = torch.device(args.teacher_device)
         teacher = AutoModelForCausalLM.from_pretrained(
             args.teacher_model_id or args.model_id, dtype=dtype_of(args.dtype), device_map=None,
@@ -256,7 +251,7 @@ def main():
         cfg.temp_affinity = args.temp_affinity
         cfg.gumbel_scale = args.gumbel_scale
         cfg.sparsity_price = args.sparsity_price
-        cfg.acc_target = args.acc_target
+        cfg.acc_target = acc_floor
         cfg.price_warmup_steps = args.price_warmup
         cfg.cos_reg_coef = args.cos_reg_coef
         print(f"resumed config from {args.resume_dir}", flush=True)
@@ -265,16 +260,28 @@ def main():
             gate_mode=args.gate_mode,
             kmax=args.kmax, select_mode=args.select_mode, top_p=args.top_p,
             top_k=args.top_k, min_layers=args.min_layers,
+            weight_mode=args.weight_mode,
             always_on_head=args.always_head,
             always_on_tail=args.always_tail, temp_affinity=args.temp_affinity,
             gumbel_scale=args.gumbel_scale, sparsity_price=args.sparsity_price,
-            price_adapt=args.price_adapt, acc_target=args.acc_target,
+            price_adapt=args.price_adapt, acc_target=acc_floor,
+            diff_easy_nll=args.diff_easy_nll, diff_hard_nll=args.diff_hard_nll,
+            diff_easy_mult=args.diff_easy_mult, diff_hard_mult=args.diff_hard_mult,
             price_warmup_steps=args.price_warmup, tau_init=args.tau_init,
             cos_reg_coef=args.cos_reg_coef)
         if args.always_layers.strip():
             overrides["always_on_layers"] = [int(x) for x in args.always_layers.split(",")
                                              if x.strip() != ""]
         cfg = SpeakerConfig.from_model_config(model.config, **overrides)
+    # Baked decode recipe (ed9/C): explicit CLI wins on fresh and on resume; None = legacy
+    decode_updates = {}
+    if args.decode_rep_penalty is not None:
+        decode_updates["repetition_penalty"] = args.decode_rep_penalty
+    if args.decode_no_repeat_ngram is not None:
+        decode_updates["no_repeat_ngram_size"] = args.decode_no_repeat_ngram
+    if decode_updates:
+        cfg.decode = {**(cfg.decode or {}), **decode_updates}
+        print(f"baked decode recipe {cfg.decode} into mod_config.json", flush=True)
     print(cfg.summary(), flush=True)
     mod_model = convert_to_speaker(model, cfg).to(device)
     if args.resume_dir:
@@ -296,6 +303,21 @@ def main():
                   f"(init {args.tau_init:+.2f} spread {args.tau_spread})", flush=True)
         mod_model.train()
 
+    if args.router_calib_batches > 0 and not args.resume_dir and cfg.gate_mode == "moe":
+        calib = []
+        for b in DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                            collate_fn=coll_fn):
+            calib.append(b)
+            if len(calib) >= args.router_calib_batches:
+                break
+        info = mod_model.calibrate_router_temp(
+            calib, target_k=(args.router_start_k or None))
+        if info:
+            print(f"router temp calibrated: {info['router_temp']:.3f} "
+                  f"(k0 {info['k_before']:.1f} -> {info['k_after']:.1f}, "
+                  f"target {info['target_k']})", flush=True)
+        mod_model.train()
+
     groups, base_params, gate_params = build_param_groups(
         mod_model, args.lr, args.router_lr, args.freeze_base, args.freeze_gate)
     n_base_train = sum(1 for p in base_params if p.requires_grad)
@@ -310,7 +332,7 @@ def main():
     rl = RunLogger(args.save_dir)
     step = 0
     ema_lm = None
-    ema_acc = None
+    dual = DualController(mod_model, cfg)  # accuracy dual: ema + warmup gate + λ adaptation
     window_t0 = time.time()
     window_tokens = 0
     stopper = StopOnPlateau(eval_every=args.eval_every, patience=args.patience,
@@ -335,19 +357,29 @@ def main():
                 kl = args.kl_coef * distill_kl_loss(
                     out.logits, t_out.logits.to(device), b["labels"], args.kl_temp)
             with torch.no_grad():
-                correct = per_token_correct(out.logits.float(), b["labels"])
-                valid_tok = (b["labels"] != -100)  # under the chat mask only the assistant segment counts (equivalent to attention_mask in the legacy protocol)
-                acc_item = correct[valid_tok].float().mean().item() if valid_tok.any() else 0.0
+                # ruler: one accuracy scale for the dual, the plateau eval and the final
+                # report (labels mode == the historical inline block under any collate)
+                acc_item = ruler.batch_acc(out.logits, b)
             # Pure Lagrangian: regularizer = lambda*mean(k), lower is better; accuracy is held
             # by the acc dual adjustment; no easy/hard split
-            task = mod_model.get_budget_loss(b["attention_mask"])
+            lmap = None
+            if args.diff_mode == "teacher" and teacher is not None:
+                # ed8 difficulty shaping: frozen-teacher NLL tiers -> per-token λ map
+                # (easy pressed harder, hard allowed depth; the dual still owns λ_base)
+                with torch.no_grad():
+                    tb = {"input_ids": b["input_ids"].to(t_device),
+                          "attention_mask": b["attention_mask"].to(t_device)}
+                    t_nll = per_token_nll(teacher(**tb).logits.float(),
+                                          b["labels"].to(t_device))
+                lmap = difficulty_mult(t_nll.to(device), cfg.diff_easy_nll,
+                                       cfg.diff_hard_nll, cfg.diff_easy_mult,
+                                       cfg.diff_hard_mult)
+            task = mod_model.get_budget_loss(b["attention_mask"], lambda_map=lmap)
             if task is not None and args.budget_ramp > 0 and step < args.budget_ramp:
                 task = task * (step / args.budget_ramp)  # gradual pressure: protect accuracy and let the gating learn first, then go sparse
             loss = lm_loss + (aux or 0) + (task or 0) + (kl or 0)
             ema_lm = ema_update(ema_lm, lm_loss.item())
-            ema_acc = ema_update(ema_acc, acc_item)
-            if step > cfg.price_warmup_steps:
-                mod_model.adapt_price(ema_acc)  # acc dual adjustment: relax lambda below target, apply more pressure above it
+            ema_acc = dual.observe(step, acc_item)
             # stats (pure k basis)
             with torch.no_grad():
                 counts = mod_model.get_active_counts()
@@ -370,7 +402,9 @@ def main():
                 trg = ngram_repeat_trigger(b["input_ids"], args.ul_n, b["labels"] != -100)
                 ul = unlikelihood_loss(out.logits[:, :-1], b["input_ids"][:, 1:], trg[:, 1:])
             elif args.ul_mode == "rollout" and step % args.rollout_every == 0:
-                ul = rollout_unlikelihood(mod_model, b, args, tok, device)
+                ul = rollout_unlikelihood(mod_model, b, tok, device,
+                                          args.rollout_prompt, args.rollout_tokens,
+                                          args.ul_n)
             if ul is not None:
                 loss = loss + args.ul_coef * ul
             opt.zero_grad()
@@ -381,18 +415,25 @@ def main():
                 rate = window_tokens / max(time.time() - window_t0, 1e-6)
                 sp = mod_model.get_layer_sparsity()
                 spars = sum(sp[i] for i in cfg.gated_layers) / max(len(cfg.gated_layers), 1)
-                mem_gb = torch.cuda.memory_allocated(device) / 1024**3
+                mem_gb = torch.cuda.memory_allocated(device) / 1024**3 \
+                    if device.type == "cuda" else 0.0
+                # repetition visibility (P2): GT-side n-gram recurrence density, near-zero
+                # cost at log cadence; the deployment-side signal is the plateau probe below
+                rep_gt = gt_repeat_rate(b["input_ids"], b["labels"] != -100, args.ul_n)
                 rl.metrics(step=step, lm=round(lm_loss.item(), 4), ema_lm=round(ema_lm, 4),
                             acc=round(acc_item, 4), ema_acc=round(ema_acc, 4),
                             k=round(mean_k, 3), k_std=round(std_k, 3), spars=round(spars, 4),
                             aux=round(float(aux.detach()), 5) if aux is not None else 0.0,
                             task=round(float(task.detach()), 4) if task is not None else 0.0,
+                            dlambda=(round(float(lmap[b["labels"] != -100].mean()), 3)
+                                     if lmap is not None else None),
                             tot=round(float(loss.detach()), 4),
                             kl=round(float(kl.detach()), 4) if kl is not None else None,
                             ul=round(float(ul.detach()), 4) if ul is not None else None,
                             price=round(cfg.sparsity_price, 5), ta=round(cfg.temp_affinity, 3),
                             gumbel=round(cfg.gumbel_scale, 3), tok_s=round(rate, 1),
-                            mem_gb=round(mem_gb, 2), est_mb=round(est_mb, 2))
+                            mem_gb=round(mem_gb, 2), est_mb=round(est_mb, 2),
+                            rep_gt=round(rep_gt, 4))
                 RunLogger.status(
                     f"[{time.strftime('%H:%M:%S')}] step {step} lm {ema_lm:.3f} "
                     f"acc {ema_acc:.2f} k {mean_k:.1f}±{std_k:.1f} spars {spars:.0%} "
@@ -402,7 +443,7 @@ def main():
                 window_tokens = 0
             if step % stopper.eval_every == 0 and stop_subset:
                 # plateau check (eval_heldout restores train mode itself); per-layer load written to layers.jsonl at low frequency
-                chk = eval_heldout(mod_model, stop_subset, coll_fn)
+                chk = eval_heldout(mod_model, stop_subset, coll_fn, valid_mode=ruler.mode)
                 rl.layers(step, mod_model.get_layer_usage(), cfg.always_on_layers)
                 with open(os.path.join(args.save_dir, "converge.jsonl"), "a", encoding="utf-8") as f:
                     f.write(json.dumps({"step": step, "subset_loss": chk["loss"],
@@ -414,6 +455,13 @@ def main():
                 mk = chk.get("mean_k")
                 RunLogger.event(f"step {step} subset_loss {chk['loss']:.4f} "
                                 f"best {stopper.best} k {mk if mk is not None else '-'}, ckpt saved")
+                if args.rep_probe:
+                    # repetition visibility (P2, r4 gen-probe resurrected): the plateau
+                    # stopper only watches subset_loss — a model can "converge" straight
+                    # into a repetition attractor without this signal ever moving it
+                    r3 = rollout_rep3_probe(mod_model, stop_subset, tok, device)
+                    RunLogger.event(f"step {step} rep3 probe {r3:.3f} "
+                                    f"(5 prompts x 24 tok greedy, trend-only)")
                 if stopper.check(step, chk["loss"]):
                     RunLogger.event(f"converged at step {step}, "
                                     f"best heldout-subset loss {stopper.best:.3f}")
@@ -434,7 +482,7 @@ def main():
     print(f"saved to {args.save_dir}", flush=True)
     # Final eval: same-distribution held-out; accuracy delta = Speaker - dense baseline, at a glance
     if eval_texts and dense_res is not None:
-        mod_res = eval_heldout(mod_model, eval_texts, coll_fn)
+        mod_res = eval_heldout(mod_model, eval_texts, coll_fn, valid_mode=ruler.mode)
         print(f"heldout | dense loss {dense_res['loss']:.3f} acc {dense_res['acc']:.3f} "
               f"| mod loss {mod_res['loss']:.3f} acc {mod_res['acc']:.3f} "
               f"(Δloss {mod_res['loss'] - dense_res['loss']:+.3f} Δacc {mod_res['acc'] - dense_res['acc']:+.3f}) "

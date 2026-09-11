@@ -30,8 +30,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from data.sft import SFTDataset, make_collate
 from speaker import SpeakerConfig, convert_to_speaker
 from speaker.metrics import per_token_correct, per_token_nll
-from baselines.lib import (collect_modd_stats, collect_mdf_stats, eval_heldout_rt,
-                           patch_model_mdf, patch_model_modd, patch_model_rt)
+from baselines.assemble import assemble  # noqa: E402
+from baselines.lib import collect_mdf_stats, collect_modd_stats, eval_heldout_rt
 
 
 def parse_args():
@@ -57,6 +57,7 @@ def parse_args():
     p.add_argument("--gen_tokens", type=int, default=0,
                    help=">0 additionally runs a dense-vs-ours generation comparison (new tokens per prompt)")
     p.add_argument("--out", default=".logs/kdist.json")
+    p.add_argument("--no_png", action="store_true")
     return p.parse_args()
 
 
@@ -69,18 +70,6 @@ def load_base(src, device):
 
 def weights_gb(model):
     return sum(p.numel() * p.element_size() for p in model.parameters()) / 1e9
-
-
-def wrap_lora(m, lcfg, args):
-    """Wrap peft per the ckpt/CLI LoRA spec (same params as training); modd/mdf pass their
-    config, ours passes {}."""
-    from peft import LoraConfig, TaskType, get_peft_model
-    targets = lcfg.get("lora_targets")
-    return get_peft_model(m, LoraConfig(
-        r=lcfg.get("lora_rank", args.lora_rank),
-        lora_alpha=lcfg.get("lora_alpha", args.lora_alpha),
-        target_modules=targets or [t.strip() for t in args.lora_targets.split(",") if t.strip()],
-        lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM))
 
 
 def fwd_eval(model, texts, coll, device, batch_size, k_fn=None, layer_fn=None):
@@ -214,17 +203,10 @@ def main():
 
     for ckpt in args.ours:
         tag = f"ours:{os.path.basename(ckpt.rstrip('/'))}"
-        m = load_base(ckpt if os.path.exists(os.path.join(ckpt, "config.json"))
-                      else args.model_id, device)
+        asm = assemble(ckpt, args.model_id, args, device, skip_mode=None)
+        w = asm.model
+        m = w
         oc = SpeakerConfig.from_json(os.path.join(ckpt, "mod_config.json"))
-        if args.use_lora:
-            m = wrap_lora(m, {}, args)
-        w = convert_to_speaker(m, oc)
-        sd = torch.load(os.path.join(ckpt, "gate.pt"), map_location="cpu")
-        missing, unexp = w.load_state_dict(sd, strict=False)
-        n_drop = sum(1 for k2 in missing if "lora" in k2 or "router" in k2)
-        assert n_drop == 0, f"[{ckpt}] gate.pt keys mismatch (LoRA spec differs from training?)"
-        w.to(device)
         n_always = len(oc.always_on_layers)
         gp = sum(p.numel() for p in w.get_router_parameters())
         out[tag] = {"weights_gb": weights_gb(m), "gate_params": gp,
@@ -254,17 +236,9 @@ def main():
         torch.cuda.empty_cache()
 
     if args.modd:
-        with open(os.path.join(args.modd, "modd_config.json")) as f:
-            mc = json.load(f)
-        m = load_base(args.modd if os.path.exists(os.path.join(args.modd, "config.json"))
-                      else args.model_id, device)
-        routed = patch_model_modd(m, mc["is_routed"], capacity=mc.get("capacity", 0.125))
-        if mc.get("use_lora"):
-            m = wrap_lora(m, mc, args)  # same order as training (patch→peft), key layout consistent
-        m.load_state_dict(torch.load(os.path.join(args.modd, "routers.pt"),
-                                     map_location="cpu"), strict=False)
-        m.to(device)
-        n_dense = len(mc["is_routed"]) - sum(mc["is_routed"])
+        asm = assemble(args.modd, args.model_id, args, device)
+        m, routed, mc = asm.model, asm.routed, asm.cfg
+        n_dense = asm.n_dense
         r_idx = [i for i, r in enumerate(mc["is_routed"]) if r]
         out["modd"] = {"weights_gb": weights_gb(m)}
 
@@ -290,17 +264,9 @@ def main():
         torch.cuda.empty_cache()
 
     if args.mdf:
-        with open(os.path.join(args.mdf, "mdf_config.json")) as f:
-            mc = json.load(f)
-        m = load_base(args.mdf if os.path.exists(os.path.join(args.mdf, "config.json"))
-                      else args.model_id, device)
-        routed = patch_model_mdf(m, mc["is_routed"], p=mc.get("p", 0.5))
-        if mc.get("use_lora"):
-            m = wrap_lora(m, mc, args)  # same order as training (patch→peft), key layout consistent
-        m.load_state_dict(torch.load(os.path.join(args.mdf, "routers.pt"),
-                                     map_location="cpu"), strict=False)
-        m.to(device)
-        n_dense = len(mc["is_routed"]) - sum(mc["is_routed"])
+        asm = assemble(args.mdf, args.model_id, args, device)
+        m, routed, mc = asm.model, asm.routed, asm.cfg
+        n_dense = asm.n_dense
         r_idx = [i for i, r in enumerate(mc["is_routed"]) if r]
         out["mdf"] = {"weights_gb": weights_gb(m)}
 
@@ -326,16 +292,10 @@ def main():
         torch.cuda.empty_cache()
 
     if args.rt:
-        with open(os.path.join(args.rt, "rt_config.json")) as f:
-            rc = json.load(f)
-        m = load_base(args.model_id, device)
-        gated = patch_model_rt(m, rc["is_mod"], rc.get("granularity", "block_token"),
-                               rc.get("threshold", 0.5), rc.get("target"), rc.get("scale", 0.0))
-        m.load_state_dict(torch.load(os.path.join(args.rt, "routers.pt"),
-                                     map_location="cpu"), strict=False)
-        m.to(device)
-        r = eval_heldout_rt(m, gated, texts, coll, args.batch_size,
-                            n_always=len(rc["is_mod"]) - sum(rc["is_mod"]))
+        asm = assemble(args.rt, args.model_id, args, device)
+        m, gated = asm.model, asm.gated
+        rc = asm.cfg
+        r = eval_heldout_rt(m, gated, texts, coll, args.batch_size, n_always=asm.n_always)
         torch.cuda.reset_peak_memory_stats(device)
         with torch.no_grad():
             for i in range(0, len(texts), args.batch_size):
@@ -412,7 +372,7 @@ def main():
         json.dump(out, f, indent=1, ensure_ascii=False)
     print(f"saved {args.out}", flush=True)
     try:
-        png = plot(out, os.path.splitext(args.out)[0] + ".png")
+        png = None if args.no_png else plot(out, os.path.splitext(args.out)[0] + ".png")
         print(f"saved {png}", flush=True)
     except ImportError:
         print("matplotlib unavailable, skipping plot", flush=True)

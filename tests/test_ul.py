@@ -6,7 +6,8 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
-from finetune.train import ngram_repeat_trigger, unlikelihood_loss
+from finetune.train import ngram_repeat_trigger, unlikelihood_loss  # shim guard: the historical import path keeps working
+from speaker.ul import gt_repeat_rate, rep3_rate
 
 
 def test_trigger():
@@ -63,8 +64,31 @@ def test_pushdown():
     print(f"[PASS] pushdown (p 0.9997 -> {p_after:.4f})")
 
 
+def test_rep3_rate():
+    # distinct trigrams -> 0; exact loop "aaaaaaa": 5 grams all "aaa" -> 1 - 1/5 = 0.8
+    assert rep3_rate("abcdefgh") == 0.0
+    assert abs(rep3_rate("aaaaaaa") - 0.8) < 1e-6
+    # "abcabc": grams [abc,bca,cab,abc] -> 1 recurring of 4
+    assert abs(rep3_rate("abcabc") - 0.25) < 1e-6
+    print("[PASS] rep3_rate (distinct 0 / loop 0.8 / mixed 0.25)")
+
+
+def test_gt_repeat_rate():
+    ids = torch.tensor([[1, 2, 3, 1, 2, 3, 9]])
+    valid = torch.ones_like(ids, dtype=torch.bool)
+    # only position 5 (second (1,2,3)) triggers -> 1/7
+    assert abs(gt_repeat_rate(ids, valid, 3) - 1 / 7) < 1e-6
+    # invalid positions never trigger but stay out of the denominator
+    v2 = valid.clone()
+    v2[0, 5] = False
+    assert gt_repeat_rate(ids, v2, 3) == 0.0
+    print("[PASS] gt_repeat_rate (density / valid blocking)")
+
+
 if __name__ == "__main__":
     test_trigger()
     test_loss_value()
     test_pushdown()
+    test_rep3_rate()
+    test_gt_repeat_rate()
     print("All UL tests passed.")

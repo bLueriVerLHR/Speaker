@@ -14,7 +14,8 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from speaker import SpeakerConfig, convert_to_speaker
-from baselines.lib import patch_model_modd, patch_model_mdf, patch_model_rt
+from baselines.assemble import assemble  # noqa: E402
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -40,6 +41,10 @@ def parse_args():
                    help="decode-time repetition penalty (>1 penalizes already-seen tokens, 1.0=off)")
     p.add_argument("--no_repeat_ngram", type=int, default=0,
                    help="decode-time n-gram hard ban (>0 forbids repeating any n-gram from prompt/output)")
+    p.add_argument("--use_ckpt_decode", action="store_true",
+                   help="ours ckpts: use the ckpt-shipped decode recipe (mod_config.json decode block, "
+                        "ed9/C) instead of --rep_penalty/--no_repeat_ngram; other families and "
+                        "ckpts without a block keep CLI values (warns loudly on fallback)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--use_lora", default=True, action=argparse.BooleanOptionalAction,
                    help="must be on when the ckpt contains LoRA, otherwise lora_ weights in gate.pt are silently dropped by strict=False")
@@ -48,6 +53,7 @@ def parse_args():
     p.add_argument("--lora_targets", default="q_proj,v_proj")
     p.add_argument("--resident", default="", help="GPU-resident layers, comma separated; empty = all layers on GPU. e.g. 0,1,15,16,17,19,22,23")
     p.add_argument("--out", default="/tmp/gen_eval.json")
+    p.add_argument("--no_png", action="store_true")
     return p.parse_args()
 
 def load_texts(path, offset, n):
@@ -154,96 +160,30 @@ def load_base(model_id, device):
 
 
 def load_ours(args, tok, device, ckpt):
-    m2 = load_base(args.model_id, device)
-    if args.use_lora:
-        from peft import LoraConfig, TaskType, get_peft_model
-        m2 = get_peft_model(m2, LoraConfig(
-            r=args.lora_rank, lora_alpha=args.lora_alpha,
-            target_modules=[t.strip() for t in args.lora_targets.split(",") if t.strip()],
-            lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM))
-    cfg = SpeakerConfig.from_json(f"{ckpt}/mod_config.json")
-    mod = convert_to_speaker(m2, cfg)
-    sd = torch.load(f"{ckpt}/gate.pt", map_location="cpu")
-    missing, unexp = mod.load_state_dict(sd, strict=False)
-    print(f"gate.pt loaded, missing {len(missing)} unexpected {len(unexp)}", flush=True)
+    asm = assemble(ckpt, args.model_id, args, device)
+    mod = asm.model
     if args.resident.strip():
         resident = mod.set_placement([int(x) for x in args.resident.split(",") if x.strip() != ""],
                                      gpu_device=device, cpu_device="cpu")
         print(f"placement resident {resident} gpu-GB {mod.resident_gb('cuda'):.2f} "
               f"(full {sum(p.numel()*p.element_size() for p in mod.parameters())/1e9:.2f})", flush=True)
-    return mod.to(device)
-
-
-def wrap_lora(m, cfg_json, args):
-    """Wrap peft per the LoRA spec in the ckpt config (same params as training); falls back to
-    CLI args when absent."""
-    from peft import LoraConfig, TaskType, get_peft_model
-    targets = cfg_json.get("lora_targets")
-    return get_peft_model(m, LoraConfig(
-        r=cfg_json.get("lora_rank", args.lora_rank),
-        lora_alpha=cfg_json.get("lora_alpha", args.lora_alpha),
-        target_modules=targets or [t.strip() for t in args.lora_targets.split(",") if t.strip()],
-        lora_dropout=0.05, bias="none", task_type=TaskType.CAUSAL_LM))
-
-
-def _check_loaded(ckpt, missing, unexp):
-    bad = [k for k in missing if "lora" in k or "router" in k]
-    assert not bad, f"[{ckpt}] routers.pt keys mismatch (LoRA spec differs from training?)"
-    print(f"routers.pt missing {len(missing)} base keys, unexpected {len(unexp)}", flush=True)
+    return mod
 
 
 def load_modd(args, device, ckpt):
-    with open(os.path.join(ckpt, "modd_config.json")) as f:
-        mc = json.load(f)
-    base_src = ckpt if os.path.exists(os.path.join(ckpt, "config.json")) else args.model_id
-    m = load_base(base_src, device)
-    patch_model_modd(m, mc["is_routed"], capacity=mc.get("capacity", 0.125))
-    if mc.get("use_lora"):
-        m = wrap_lora(m, mc, args)  # same order as training (patch→peft), key layout consistent
-    missing, unexp = m.load_state_dict(
-        torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu"), strict=False)
-    _check_loaded(ckpt, missing, unexp)
-    return m.to(device)
+    return assemble(ckpt, args.model_id, args, device).model
 
 
 def load_mdf(args, device, ckpt):
-    with open(os.path.join(ckpt, "mdf_config.json")) as f:
-        mc = json.load(f)
-    base_src = ckpt if os.path.exists(os.path.join(ckpt, "config.json")) else args.model_id
-    m = load_base(base_src, device)
-    patch_model_mdf(m, mc["is_routed"], p=mc.get("p", 0.5))
-    if mc.get("use_lora"):
-        m = wrap_lora(m, mc, args)  # same order as training (patch→peft), key layout consistent
-    missing, unexp = m.load_state_dict(
-        torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu"), strict=False)
-    _check_loaded(ckpt, missing, unexp)
-    return m.to(device)
+    return assemble(ckpt, args.model_id, args, device).model
 
 
 def load_dense_ft(args, device, ckpt):
-    with open(os.path.join(ckpt, "denseft_config.json")) as f:
-        dc = json.load(f)
-    m = load_base(args.model_id, device)
-    if dc.get("use_lora", True):
-        m = wrap_lora(m, dc, args)
-    sd = torch.load(os.path.join(ckpt, "lora.pt"), map_location="cpu")
-    missing, unexp = m.load_state_dict(sd, strict=False)
-    bad = [k for k in missing if "lora" in k]
-    assert not bad, f"[{ckpt}] lora.pt keys mismatch"
-    print(f"lora.pt loaded, missing {len(missing)} base keys, unexpected {len(unexp)}",
-          flush=True)
-    return m.to(device)
+    return assemble(ckpt, args.model_id, args, device).model
 
 
 def load_rt(args, device, ckpt):
-    with open(os.path.join(ckpt, "rt_config.json")) as f:
-        rc = json.load(f)
-    m = load_base(args.model_id, device)
-    patch_model_rt(m, rc["is_mod"], rc.get("granularity", "block_token"),
-                   rc.get("threshold", 0.5), rc.get("target"), rc.get("scale", 0.0))
-    m.load_state_dict(torch.load(os.path.join(ckpt, "routers.pt"), map_location="cpu"),
-                      strict=False)
-    return m.to(device)
+    return assemble(ckpt, args.model_id, args, device).model
 
 
 def plot_gen(summary, png_path):
@@ -313,6 +253,22 @@ def main():
 
     methods, rows = {}, []
     for tag, ckpt in queue:
+        rp, ng, dec_src = args.rep_penalty, args.no_repeat_ngram, "cli"
+        if tag.startswith("ours") and args.use_ckpt_decode:
+            try:
+                with open(os.path.join(ckpt, "mod_config.json"), encoding="utf-8") as f:
+                    dec = json.load(f).get("decode") or {}
+            except OSError:
+                dec = {}
+            if dec:
+                rp = dec.get("repetition_penalty", rp)
+                ng = dec.get("no_repeat_ngram_size", ng)
+                dec_src = f"ckpt:{dec}"
+            else:
+                print(f"[{tag}] WARNING: --use_ckpt_decode but no decode block in "
+                      f"mod_config.json — falling back to CLI", flush=True)
+        if dec_src != "cli":
+            print(f"[{tag}] decode from {dec_src}", flush=True)
         if tag == "dense":
             m = load_base(args.model_id, device).to(device)
         elif tag.startswith("ours"):
@@ -321,10 +277,12 @@ def main():
             m = loaders[tag if ":" not in tag else tag.split(":")[0]](args, device, ckpt)
         outs, outs_s, dt, peak, avg, usage, n_new = run_gen(
             m, tok, prompts, args.max_new, device, tag, args.temp,
-            rep_penalty=args.rep_penalty, no_repeat_ngram=args.no_repeat_ngram)
+            rep_penalty=rp, no_repeat_ngram=ng)
         stab = sum(rouge_l_f1(a, b) for a, b in zip(outs, outs_s))/max(len(outs), 1)
         methods[tag] = {"outs": outs, "time": dt, "peak_gb": peak, "avg_gb": avg,
                         "ms_per_tok": dt*1000/max(n_new, 1), "stability": stab,
+                        "decode_used": {"rep_penalty": rp, "no_repeat_ngram": ng,
+                                        "src": dec_src},
                         "usage": ({k: round(v[0], 3) for k, v in sorted(usage.items())}
                                   if usage else None)}
         print(f"[{tag}] done", flush=True)
@@ -366,7 +324,8 @@ def main():
         json.dump(summary, f, ensure_ascii=False, indent=1)
     print(f"saved {args.out}", flush=True)
     try:
-        print(f"saved {plot_gen(summary, os.path.splitext(args.out)[0] + '.png')}", flush=True)
+        if not args.no_png:
+            print(f"saved {plot_gen(summary, os.path.splitext(args.out)[0] + '.png')}", flush=True)
     except ImportError:
         print("matplotlib unavailable, skipping plot", flush=True)
 

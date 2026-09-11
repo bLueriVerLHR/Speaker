@@ -7,10 +7,10 @@ are not interchangeable):
   execution. "MoE gating applied directly on the layers": the gated layers are the experts, the
   shared layers sit outside the routing pool. Selection: top-p (default) accumulates probability
   in descending log p order and stops upon reaching p, k is adaptive per token; top-k (optional)
-  fixes k. Mixing: the selected layers' probabilities are renormalized into w, weighted residual
-  h += w·(F(h)-h); unselected layers are not executed (decode writes no K/V). Gradient: forward
-  hard, backward soft-inclusive sigmoid((p - cum)/T) STE, budget λ·mean(k) differentiable via the
-  soft count.
+  fixes k. Mixing: the selected layers' probabilities become residual weights (pmax: w = p/p_max,
+  gain scales with k; legacy renorm: Σw = 1, see select_and_weight); unselected layers are not
+  executed (decode writes no K/V). Gradient: forward hard, backward soft-inclusive
+  sigmoid((p - cum)/T) STE, budget λ·mean(k) differentiable via the soft count.
 
 - threshold (legacy scheme): Router gives per-layer independent a_l(t) affinity logits; the
   threshold is carried solely by tau (no bias, avoiding bias-tau collinearity); each gated layer
@@ -64,6 +64,16 @@ class JointRouter(nn.Module):
     """moe scheme: gated-region entry single-point routing Linear(H->G, no bias)
     + per-layer learnable prior bias (G,).
 
+    Zero init (ed7): the router starts uniform — a maximally diffuse, token-stable
+    selection with every selected layer at full strength under pmax (the closest
+    dense approximation the top-p/kmax budget allows; exactly dense iff kmax >= G).
+    The legacy random init selected arbitrary layers at full strength (peaked-random
+    routing over large-norm hiddens, varying per token) — a noisier hole with less
+    learnable structure (r7: lm 13.2 at step 0). This follows the dense-start
+    discipline of RT/mdf zero-init and threshold's negative tau_init as closely as
+    a joint-softmax top-p architecture permits. Symmetry breaks on the first
+    gradient step (the layers' F_l differ).
+
     Outputs fp32 logits [B,T,G]; softmax temperature/annealing/Gumbel are applied by the caller
     (temperature acts on the logits, selection happens in log p space)."""
 
@@ -71,7 +81,7 @@ class JointRouter(nn.Module):
         super().__init__()
         self.net = nn.Linear(hidden_size, n_gated, bias=False)
         self.layer_bias = nn.Parameter(torch.zeros(n_gated))
-        nn.init.normal_(self.net.weight, std=0.02)
+        nn.init.zeros_(self.net.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype in (torch.bfloat16, torch.float16):
@@ -87,7 +97,7 @@ class RouteDecision:
     log_p: torch.Tensor     # [B,T,G]
     probs: torch.Tensor     # [B,T,G] softmax probabilities
     selected: torch.Tensor  # [B,T,G] hard 0/1 (padding=0)
-    weights: torch.Tensor   # [B,T,G] selected layers' renormalized probabilities (weighted residual), 0 elsewhere
+    weights: torch.Tensor     # [B,T,G] selected layers' residual weights (pmax: p/p_max, top = 1.0; renorm: Σ = 1), 0 elsewhere
     valid: torch.Tensor     # [B,T] float padding mask
     k: torch.Tensor         # [B,T] hard count of activated gated layers (detached, for statistics)
     k_soft: torch.Tensor    # [B,T] differentiable soft count (degenerates to k in topk mode)
@@ -96,8 +106,9 @@ class RouteDecision:
 def select_and_weight(logits: torch.Tensor, select_mode: str = "topp",
                       top_p: float = 0.9, top_k: int = 6, min_layers: int = 1,
                       kmax: int = 10, count_temp: float = 0.1,
-                      valid: torch.Tensor = None) -> RouteDecision:
-    """moe scheme: logits [B,T,G] -> selection + renormalized weights + soft count. All fp32.
+                      valid: torch.Tensor = None,
+                      weight_mode: str = "pmax") -> RouteDecision:
+    """moe scheme: logits [B,T,G] -> selection + weights + soft count. All fp32.
 
     top-p: the j-th largest layer is selected iff its preceding cumulative probability
     cum_{j-1} < top_p (the first layer is always selected);
@@ -105,6 +116,16 @@ def select_and_weight(logits: torch.Tensor, select_mode: str = "topp",
     Soft inclusion (backward only): sigmoid((top_p - cum_{j-1}) / count_temp); gradients flow
     through cum (softmax probabilities) back into the router — pressing k is equivalent to
     pressing distribution entropy (the sharper the distribution, the smaller k).
+    weight_mode: how the selected layers' probabilities become residual weights —
+      "pmax" (default, ed7 fix): w = p / p_max. Total gain scales WITH k (each opened
+        layer adds up to a full-strength residual, as in the threshold scheme), so the
+        LM loss no longer punishes depth and the dual's "buy layers back" lever works;
+        the all-selected limit is exactly the dense forward (healthy dense start).
+      "renorm" (legacy): w = p / Σ_selected p (Σw = 1). Total gain is FIXED at 1.0
+        whatever k is: opening a layer dilutes the good layers' weights (LM punishes
+        k), and relaxing λ cannot buy accuracy back (dual lever disconnected → λ
+        bottoms out while acc stays low; r7 moe_p70: init lm 13.2/acc 0.01, 4000
+        steps only back to acc 0.24, Δacc −28pt, λ floored at 1e-4).
     """
     G = logits.shape[-1]
     log_p = F.log_softmax(logits.float(), dim=-1)
@@ -135,7 +156,13 @@ def select_and_weight(logits: torch.Tensor, select_mode: str = "topp",
         selected = selected * v.unsqueeze(-1)
         ste = ste * v.unsqueeze(-1)
     weights = probs * ste
-    weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-6)
+    if weight_mode == "pmax":
+        denom = weights.amax(dim=-1, keepdim=True).clamp_min(1e-6)
+    elif weight_mode == "renorm":
+        denom = weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    else:
+        raise ValueError(f"weight_mode must be pmax|renorm, got {weight_mode!r}")
+    weights = weights / denom
     if valid is not None:
         weights = weights * valid.to(weights.dtype).unsqueeze(-1)
     k = selected.sum(-1).detach()

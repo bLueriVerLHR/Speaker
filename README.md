@@ -1,13 +1,23 @@
 # Speaker: Fixed (Shared) Layers + Gated Layers for Edge-Side Efficient Inference
 
 > A **speaker** finishes syntactic reasoning with **fewer layers** and reserves the rest
-> for complex logical reasoning — the layers a token does *not* need are memory it does
+> for complex logical reasoning — the layers a token does *not* need is memory it does
 > not have to hold.
 
-Speaker turns per-token layer sparsity into edge-side gains: a smaller GPU memory
-footprint (selective weights residency + sparse KV cache), a **schedulable** layer set
-driven by the router's own activation statistics, and accuracy recovered above dense
-via KL self-distillation and a dual budget.
+Two gating schemes, one switch (`--gate_mode`), one shared fixed/gated layer design:
+
+| Scheme | `--gate_mode` | Idea |
+|---|---|---|
+| **Speaker** | `speaker` (canonical `threshold`) | per-layer gate — each layer decides whether this token needs to pass through it |
+| **MoL** (Mixture of Layers) | `mol` (canonical `moe`) | one joint router at the gated-region entry picks the layer subset, MoE-style |
+
+Both target **edge-side memory demand**: a smaller GPU footprint (selective weights
+residency + sparse KV cache, −46% per-token demand at 7B), a **schedulable** layer set
+driven by the router's own activation statistics, and accuracy recovered via a unified
+**post-training repair** pipeline (profile a few rounds → promote hot layers to fixed →
+continue finetuning shared + gated layers, with KL self-distillation, rollout
+unlikelihood against repetition, and a dual budget). The roadmap: repair on traditional
+self-attention first, then adapt to linear-attention backbones.
 
 ## 1. Core Idea
 
@@ -56,6 +66,8 @@ Training turns two knobs on this picture:
       loss  = LM + λ·mean(k) + β·KL(sparse ‖ frozen dense)  (+ aux regularizers)
       dual  :  ema_acc < acc_target  ⇒  λ relaxes (buys layers back)
                ema_acc ≥ acc_target  ⇒  λ tightens (pushes sparsity)
+      acc_target defaults to auto: measured dense acc − margin, so the floor
+      follows the base model instead of a hand-set constant (details: docs/training.md)
 ```
 
 Gating exists in two modes behind one switch (`gate_mode`): **moe** (default mainline,
@@ -91,6 +103,9 @@ Speaker/
     load_profile.py   #   layer-load profiling: load -> fixed-layer promotion / GPU-CPU plan
     metrics.py        #   per-token NLL/acc / activation-memory estimate / KL distillation
     evaluate.py       #   eval_heldout + EMA (collate injected, shared with baselines)
+    ruler.py          #   accuracy scale: valid masks + acc_target policy (auto = dense − margin)
+    dual.py           #   DualController: accuracy EMA + warmup gate + λ adaptation
+    ul.py             #   anti-repetition: n-gram unlikelihood terms + rep3 probes
     checkpoint.py     #   ckpt I/O: gate-key filtering / prefix stripping / clean base
     train_common.py   #   shared training boilerplate (device/tokenizer/model/LoRA/groups)
     log.py            #   RunLogger: metrics.jsonl + layers.jsonl + one-line stdout
@@ -99,7 +114,8 @@ Speaker/
   pretrain/           # from-scratch training (design-first)
   finetune/           # finetune track: gating-first train / profile+promote / resume / eval
   baselines/          # MoD + MoDification + Router-Tuning + dense-ft + same-slice comparison
-  tests/              # offline unit suites + on-device smokes
+                      #   train_loop.py: one shared loop (BaselineRecipe per family)
+  tests/              # offline unit suites + on-device smokes (incl. ruler/dual + UL)
   tools/              # experiment tooling: eval_gen / probe_layers / probe_kdist / plotting
 ```
 
@@ -146,7 +162,7 @@ python3 pretrain/train.py --device cuda:0 --max_steps 500 --num_layers 12 --hidd
 
 # Track B — finetune (mainline): gating-first, no prior fixed layers
 python3 finetune/train.py --model_id ./models/Qwen2.5-7B-Instruct --use_lora \
-    --use_chat_template --always_head 0 --always_tail 0 --ul_mode rollout --ul_coef 0.3 \
+    --use_chat_template --always_head 0 --always_tail 0 --ul_coef 0.3 \
     --eval_every 2000 --patience 10 --device cuda:0 --anneal_steps 2000 \
     --max_samples 20000 --save_dir ./ckpt/run
 # then: profile measured load -> promote fixed layers (>=90%) -> resume on new structure

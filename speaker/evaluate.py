@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from .metrics import per_token_correct, per_token_nll
+from .ruler import valid_positions
 
 
 def ema_update(prev, value, beta=0.95):
@@ -41,8 +42,7 @@ def eval_heldout(model, texts, collate_fn, batch_size=4,
             logits = out.logits.float()
             nll = per_token_nll(logits, b["labels"])
             correct = per_token_correct(logits, b["labels"])
-            valid = b["attention_mask"].bool() if valid_mode == "attention_mask" \
-                else (b["labels"] != -100)
+            valid = valid_positions(b, valid_mode)
             sum_nll += nll[valid].sum().item()
             n_tok += valid.sum().item()
             n_ok += correct[valid].sum().item()

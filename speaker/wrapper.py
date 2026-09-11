@@ -280,6 +280,7 @@ class SpeakerModelWrapper(nn.Module):
         self._ta_start = float(mod_config.temp_affinity)
         self._g_start = float(mod_config.gumbel_scale)
         self.route: Optional[RouteDecision] = None  # moe: joint routing of the current forward (written by the entry layer)
+        self._calib_capture = None  # moe router-temp calibration: list collecting (entry hidden, valid) per batch
         self._patch()
         if self.mod_config.gate_mode == "moe":
             n_gated = len(self.mod_config.gated_layers)
@@ -348,14 +349,18 @@ class SpeakerModelWrapper(nn.Module):
         if self.training and float(cfg.gumbel_scale) > 0:
             u = torch.rand_like(logits).clamp_(1e-6, 1.0 - 1e-6)
             logits = logits + (-torch.log(-torch.log(u))) * float(cfg.gumbel_scale)
-        Ta = max(float(cfg.temp_affinity), 0.05)
+        Ta = max(float(cfg.temp_affinity), 0.05) * float(getattr(cfg, "router_temp", 1.0))
         valid = None
         if attention_mask is not None and attention_mask.dim() == 2:
             valid = attention_mask.to(torch.float32)
+        cap = self._calib_capture
+        if cap is not None:
+            cap.append((h.detach(), None if valid is None else valid.detach()))
         route = select_and_weight(logits / Ta, select_mode=cfg.select_mode,
                                   top_p=cfg.top_p, top_k=cfg.top_k,
                                   min_layers=cfg.min_layers, kmax=cfg.kmax,
-                                  count_temp=cfg.count_temp, valid=valid)
+                                  count_temp=cfg.count_temp, valid=valid,
+                                  weight_mode=getattr(cfg, "weight_mode", "pmax"))
         if route.logits.device != hidden_states.device:
             route = _rd_to(route, hidden_states.device)
         self.route = route
@@ -461,11 +466,14 @@ class SpeakerModelWrapper(nn.Module):
 
     # ----- Budget -----
 
-    def get_budget_loss(self, attention_mask=None):
+    def get_budget_loss(self, attention_mask=None, lambda_map=None):
         """Pure Lagrangian budget loss (differentiable). Price accounting = actual demand per
         inference (per-token average activation memory), peak/residency ignored.
         threshold: loss = λ·mean(k) + over-kmax penalty, k via STE;
-        moe: loss = λ·mean(k_soft), k via soft inclusion (in topk mode k is fixed, returns None)."""
+        moe: loss = λ·mean(k_soft), k via soft inclusion (in topk mode k is fixed, returns None).
+        lambda_map (ed8): optional per-token λ multiplier [B,T] from difficulty shaping
+        (dual.difficulty_mult); the loss becomes λ·mean(map·k) — the dual still owns the
+        global level, the map only redistributes pressure across tokens. None = legacy path."""
         cfg = self.mod_config
         if cfg.gate_mode == "moe":
             route = self.route
@@ -476,7 +484,10 @@ class SpeakerModelWrapper(nn.Module):
             if not bool(valid.any()):
                 return None
             k = route.k_soft[valid]
-            return cfg.sparsity_price * k.mean()
+            if lambda_map is None:
+                return cfg.sparsity_price * k.mean()
+            w = lambda_map.to(k.device).float()[valid]
+            return cfg.sparsity_price * (w * k).mean()
         ste, _, _ = self._stack_masks()
         if ste is None:
             return None
@@ -490,7 +501,10 @@ class SpeakerModelWrapper(nn.Module):
                 loss = loss + cfg.over_budget_coef * over.pow(2).mean()
             if cfg.sparsity_price > 0:
                 # elastic budget core: charge per layer, λ presses mean(k)
-                loss = loss + cfg.sparsity_price * k[valid].mean()
+                kk = k[valid]
+                if lambda_map is not None:
+                    kk = lambda_map.to(kk.device).float()[valid] * kk
+                loss = loss + cfg.sparsity_price * kk.mean()
         return loss
 
     def adapt_price(self, ema_acc: float | None):
@@ -618,6 +632,77 @@ class SpeakerModelWrapper(nn.Module):
         self.get_layer_usage()  # clear usage accumulated during calibration
         return out
 
+    def calibrate_router_temp(self, batches, target_k: Optional[int] = None):
+        """moe only: init-time JointRouter logit-temperature calibration so the initial top-p
+        mean k starts near target_k (threshold returns {}). Mirror of calibrate_tau's
+        philosophy: enter the budget-ramp window from a near-dense routing distribution.
+        The temperature is persisted in SpeakerConfig (mod_config.json), not in state_dict —
+        gate.pt key sets stay unchanged; 1.0 (default / legacy ckpts) = identity."""
+        if self.mod_config.gate_mode != "moe" or self.joint_router is None:
+            return {}
+        cfg = self.mod_config
+        G = len(cfg.gated_layers)
+        lo_k = max(int(cfg.min_layers), 1)
+        hi_k = min(int(cfg.kmax), G)
+        if target_k is None:
+            target_k = max(lo_k, min(hi_k, round(0.6 * G)))
+        target_k = int(max(lo_k, min(hi_k, int(target_k))))
+        was_training = self.training
+        self.eval()
+        self._calib_capture = []
+        with torch.no_grad():
+            for b in batches:
+                self(**b)
+            captured = self._calib_capture
+            self._calib_capture = None
+            if not captured:
+                if was_training:
+                    self.train()
+                return {}
+            h = torch.cat([x.reshape(-1, x.shape[-1]) for x, _ in captured], dim=0)
+            v = torch.cat([w.reshape(-1) for _, w in captured], dim=0) \
+                if captured[0][1] is not None else None
+            if v is None:
+                v = torch.ones(h.shape[0], device=h.device)
+            keep = v > 0
+            h, v = h[keep], v[keep]
+            if h.shape[0] > 8192:  # cap calibration tokens for speed
+                idx = torch.randperm(h.shape[0], device=h.device)[:8192]
+                h, v = h[idx], v[idx]
+            raw = self.joint_router(h)  # [N,G] fp32, no gumbel (eval)
+            Ta0 = max(float(cfg.temp_affinity), 0.05)
+
+            def mean_k(t: float) -> float:
+                rd = select_and_weight(raw / (Ta0 * t), select_mode=cfg.select_mode,
+                                       top_p=cfg.top_p, top_k=cfg.top_k,
+                                       min_layers=cfg.min_layers, kmax=cfg.kmax,
+                                       count_temp=cfg.count_temp, valid=v)
+                return float((rd.k * v).sum() / v.sum().clamp_min(1.0))
+
+            k_before = mean_k(1.0)
+            t_best = 1.0
+            if k_before < target_k - 0.25:
+                # flatten the distribution (t > 1) until mean k reaches the target;
+                # only flatten — a start that is already dense enough stays untouched
+                lo, hi = 0.0, 8.0  # bisection on log2(t)
+                if mean_k(2.0 ** hi) < target_k - 0.25:
+                    t_best = 2.0 ** hi  # best effort at the cap
+                else:
+                    for _ in range(40):
+                        mid = (lo + hi) / 2
+                        if mean_k(2.0 ** mid) < target_k:
+                            lo = mid
+                        else:
+                            hi = mid
+                    t_best = 2.0 ** ((lo + hi) / 2)
+                cfg.router_temp = float(t_best)
+            k_after = mean_k(t_best)
+        if was_training:
+            self.train()
+        self.get_layer_usage()  # clear usage accumulated during calibration
+        return {"router_temp": float(t_best), "k_before": k_before,
+                "k_after": k_after, "target_k": target_k}
+
     # ----- Placement -----
 
     def set_placement(self, resident_ids, gpu_device="cuda", cpu_device="cpu"):
@@ -685,3 +770,32 @@ def convert_to_speaker(hf_model, mod_config=None, hf_config=None, **overrides):
             if hasattr(mod_config, k):
                 setattr(mod_config, k, v)
     return SpeakerModelWrapper(hf_model, mod_config)
+
+
+def apply_decode_config(speaker_model, decode) -> dict:
+    """Applies a ckpt-shipped decode recipe (ed9/C: SpeakerConfig.decode) onto the
+    underlying HF model's generation_config, so the artifact carries its validated
+    inference behavior (no reliance on the caller remembering CLI flags).
+    None/{} = legacy no-op. Only known GenerationConfig fields are set; unknown
+    keys warn loudly. Explicit generate() kwargs still override these defaults.
+    Returns the applied {field: value} mapping."""
+    if not decode:
+        return {}
+    target = getattr(speaker_model, "hf_model", speaker_model)
+    gc = getattr(target, "generation_config", None)
+    if gc is None:
+        print(f"WARNING: decode recipe {decode} has nowhere to go "
+              f"({type(target).__name__} has no generation_config) — ignored", flush=True)
+        return {}
+    applied = {}
+    for k, v in decode.items():
+        if hasattr(gc, k):
+            setattr(gc, k, v)
+            applied[k] = v
+        else:
+            print(f"WARNING: decode key {k!r} is not a GenerationConfig field — ignored",
+                  flush=True)
+    if applied:
+        print(f"[decode] applied {applied} to {type(target).__name__}.generation_config",
+              flush=True)
+    return applied

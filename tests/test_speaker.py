@@ -3,7 +3,8 @@ mechanics of shared (fixed) layers + gated layers (dual scheme).
 
 - threshold (legacy scheme): per-layer Router+tau+comp, sigmoid+STE, budget λ·mean(k)+over-kmax penalty;
 - moe (default): a single-point JointRouter(H->G) at the entry emits log p, top-p/top-k selection,
-  selected-layer probabilities renormalized into a weighted residual, budget λ·mean(k) via soft-inclusive STE.
+  selected-layer probabilities weighted into a residual (pmax: w=p/p_max, gain scales with k;
+  legacy renorm: sum-to-one), budget λ·mean(k) via soft-inclusive STE.
 Checkpoints of the two schemes are incompatible with each other; each is regressed separately.
 """
 import torch
@@ -119,6 +120,52 @@ def test_config_from_json():
     print("[PASS] config from_json (mode inference + old-key filter)")
 
 
+def test_decode_recipe():
+    """ed9/C: ckpt-shipped decode recipe — None default (legacy), JSON roundtrip,
+    old ckpts (no decode key) load as None, invalid recipes fail fast; the apply
+    helper only touches known GenerationConfig fields and warns loudly otherwise."""
+    import json
+    import os
+    import tempfile
+    from types import SimpleNamespace
+    from speaker import apply_decode_config
+    c0 = SpeakerConfig(num_hidden_layers=6, hidden_size=32)
+    assert c0.decode is None
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "c.json")
+        c0.to_json(p)
+        d = json.load(open(p))
+        assert "decode" in d and d["decode"] is None, "decode must serialize (null default)"
+        c1 = SpeakerConfig.from_json(p)
+        assert c1.decode is None, "legacy ckpts (no decode key) must load as None"
+        d["decode"] = {"repetition_penalty": 1.15, "no_repeat_ngram_size": 3}
+        json.dump(d, open(p, "w"))
+        c2 = SpeakerConfig.from_json(p)
+        assert c2.decode == {"repetition_penalty": 1.15, "no_repeat_ngram_size": 3}
+    for bad in (dict(decode="1.15"), dict(decode={"top_k": 40}),
+                dict(decode={"repetition_penalty": 0.9}),
+                dict(decode={"no_repeat_ngram_size": -1}),
+                dict(decode={"no_repeat_ngram_size": 2.5})):
+        try:
+            SpeakerConfig(num_hidden_layers=6, hidden_size=32, **bad)
+            raise AssertionError(f"should reject invalid decode recipe {bad}")
+        except ValueError:
+            pass
+    # apply helper against a fake wrapper (no weights needed)
+    gc = SimpleNamespace(repetition_penalty=1.0, no_repeat_ngram_size=0)
+    fake = SimpleNamespace(hf_model=SimpleNamespace(generation_config=gc))
+    assert apply_decode_config(fake, None) == {}
+    assert gc.repetition_penalty == 1.0, "None must be a silent no-op"
+    out = apply_decode_config(fake, {"repetition_penalty": 1.15, "no_repeat_ngram_size": 3})
+    assert out == {"repetition_penalty": 1.15, "no_repeat_ngram_size": 3}
+    assert gc.repetition_penalty == 1.15 and gc.no_repeat_ngram_size == 3
+    out = apply_decode_config(fake, {"top_k": 40})
+    assert out == {} and gc.repetition_penalty == 1.15, "unknown keys must be ignored loudly"
+    out = apply_decode_config(SimpleNamespace(), {"repetition_penalty": 1.2})
+    assert out == {}, "missing generation_config must warn and no-op"
+    print("[PASS] decode recipe (config roundtrip + validation + apply)")
+
+
 def test_router():
     """threshold: the per-layer Router has no bias; the threshold is carried solely by tau."""
     r = Router(hidden_size=32)
@@ -143,24 +190,37 @@ def test_joint_router():
 
 def test_select_top_p():
     G = 4
-    # peaked distribution: top probability >= p -> k=1, weight≈1
+    # peaked distribution: top probability >= p -> k=1, weight≈1 (both modes agree)
     logits = torch.tensor([[[10.0, 0.0, 0.0, 0.0]]])
     rd = select_and_weight(logits, top_p=0.9, kmax=10)
     assert rd.selected[0, 0].argmax().item() == 0 and rd.k[0, 0].item() == 1
     assert abs(rd.weights[0, 0, 0].item() - 1.0) < 1e-3
-    # uniform distribution: p=0.9 -> the cumulative mass only reaches p at the 4th -> k=4, weights split evenly
+    # uniform distribution: p=0.9 -> the cumulative mass only reaches p at the 4th -> k=4;
+    # pmax (default): every selected layer carries full strength (dense limit is exact)
     rd2 = select_and_weight(torch.zeros(1, 1, G), top_p=0.9, kmax=10)
     assert rd2.k[0, 0].item() == 4, rd2.k
-    assert torch.allclose(rd2.weights[0, 0], torch.full((G,), 0.25), atol=1e-6)
+    assert torch.allclose(rd2.weights[0, 0], torch.ones(G), atol=1e-6)
+    # renorm (legacy): the same selection splits one unit of gain evenly
+    rd2r = select_and_weight(torch.zeros(1, 1, G), top_p=0.9, kmax=10,
+                             weight_mode="renorm")
+    assert rd2r.k[0, 0].item() == 4
+    assert torch.allclose(rd2r.weights[0, 0], torch.full((G,), 0.25), atol=1e-6)
     # kmax hard cap: uniform G=8 with p=0.9 would give k=8, truncated to 3
     rd3 = select_and_weight(torch.zeros(1, 1, 8), top_p=0.9, kmax=3)
-    assert rd3.k[0, 0].item() == 3 and abs(rd3.weights.sum().item() - 1.0) < 1e-5
+    assert rd3.k[0, 0].item() == 3 and abs(rd3.weights.sum().item() - 3.0) < 1e-5
     # min_layers floor: peaked + min_layers=2 -> k=2
     rd4 = select_and_weight(logits, top_p=0.9, min_layers=2, kmax=10)
     assert rd4.k[0, 0].item() == 2
-    # selected-layer weights always sum to 1, unselected are 0
+    # pmax invariant: the top selected layer always carries 1.0, gain scales with k
     rd5 = select_and_weight(torch.randn(2, 5, 6), top_p=0.7, kmax=5)
-    s = rd5.weights.sum(-1)
+    topw = rd5.weights.amax(-1)
+    assert torch.allclose(topw, torch.ones_like(topw), atol=1e-4)
+    tot = rd5.weights.sum(-1)
+    assert bool(((tot > 0) & (tot <= rd5.k + 1e-4)).all())  # gain in (0, k]: scales with k
+    # renorm invariant (legacy): selected-layer weights sum to 1
+    rd5r = select_and_weight(torch.randn(2, 5, 6), top_p=0.7, kmax=5,
+                             weight_mode="renorm")
+    s = rd5r.weights.sum(-1)
     assert torch.allclose(s, torch.ones_like(s), atol=1e-4)
     # padding: all zeros
     valid = torch.ones(2, 5)
@@ -280,6 +340,85 @@ def test_budget_moe():
     print("[PASS] eval deterministic + hard forward (moe)")
 
 
+def test_budget_lambda_map():
+    """ed8 difficulty shaping: per-token λ map plumbing — ones map == legacy path
+    bit-for-bit (both schemes), zeros map == 0, gradients still reach the router."""
+    n, h = 6, 32
+    am = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]])
+    x = torch.randn(2, 4, h)
+    for mode in ("moe", "threshold"):
+        cfg = SpeakerConfig(num_hidden_layers=n, hidden_size=h, gate_mode=mode,
+                            kmax=4, top_p=0.9, sparsity_price=0.05, gumbel_scale=0.0)
+        mod = SpeakerModelWrapper(FakeHF(n=n, h=h), cfg)
+        mod.train()
+        mod(hidden_states=x, attention_mask=am)
+        base = mod.get_budget_loss(am)
+        ones = mod.get_budget_loss(am, torch.ones(2, 4))
+        assert base is not None and ones is not None
+        assert torch.equal(base, ones), f"{mode}: ones map must equal the legacy path"
+        zeros = mod.get_budget_loss(am, torch.zeros(2, 4))
+        assert zeros.item() == 0.0, f"{mode}: zeros map must zero the budget"
+        half = mod.get_budget_loss(am, torch.full((2, 4), 0.5))
+        assert abs(half.item() - 0.5 * base.item()) < 1e-6, f"{mode}: uniform map must scale linearly"
+        mod.zero_grad()
+        half.backward()
+        ng = sum(1 for p in mod.get_router_parameters()
+                 if p.grad is not None and p.grad.abs().sum().item() > 0)
+        assert ng > 0, f"{mode}: shaped budget must keep router gradients"
+    print("[PASS] budget lambda_map plumbing (ones==legacy, zeros==0, linear, grads)")
+
+
+def test_router_temp_calib():
+    """moe: init-time router-temperature calibration (r7 fix): a peaked start (large-norm
+    random projection, mimics 7B) is flattened until the top-p mean k reaches the target;
+    router_temp=1.0 must stay bit-for-bit identity; threshold returns {}."""
+    n, h = 12, 32
+    torch.manual_seed(0)
+    cfg = SpeakerConfig(num_hidden_layers=n, hidden_size=h, gate_mode="moe",
+                        select_mode="topp", top_p=0.7, kmax=8, gumbel_scale=0.0)
+    mod = SpeakerModelWrapper(FakeHF(n=n, h=h), cfg)
+    assert cfg.gated_layers == list(range(2, 10)), cfg.gated_layers
+    # threshold mirror: no-op
+    mod2 = SpeakerModelWrapper(FakeHF(n=n, h=h),
+                               SpeakerConfig(num_hidden_layers=n, hidden_size=h,
+                                             gate_mode="threshold"))
+    assert mod2.calibrate_router_temp([{"hidden_states": torch.randn(2, 4, h)}]) == {}
+    # peaked start (the ed7 default init is zeros/uniform, so construct the peak
+    # explicitly — temperature of a uniform distribution is unobservable)
+    nn.init.normal_(mod.joint_router.net.weight, std=0.02)
+    mod.joint_router.net.weight.data *= 16.0
+    am = torch.ones(2, 8)
+    x = torch.randn(2, 8, h)
+    mod.eval()
+    with torch.no_grad():
+        o1 = mod(hidden_states=x, attention_mask=am)["logits"]
+        cfg.router_temp = 1.0
+        o2 = mod(hidden_states=x, attention_mask=am)["logits"]
+        assert torch.equal(o1, o2), "router_temp=1.0 must be bit-for-bit identity"
+        cfg.router_temp = 2.5
+        o3 = mod(hidden_states=x, attention_mask=am)["logits"]
+        assert not torch.equal(o1, o3), "a flattening temperature must change routing"
+        cfg.router_temp = 1.0
+    # peaked start -> calibration lifts mean k to the target (init is zeros since ed7,
+    # so the peak is constructed explicitly)
+    nn.init.normal_(mod.joint_router.net.weight, std=0.02)
+    mod.joint_router.net.weight.data *= 16.0
+    batches = [{"hidden_states": torch.randn(2, 16, h),
+                "attention_mask": torch.ones(2, 16)} for _ in range(3)]
+    info = mod.calibrate_router_temp(batches, target_k=6)
+    assert info, "moe calibration should return info"
+    assert info["k_before"] < 4.5, f"peaked start expected, got k0 {info['k_before']}"
+    assert abs(info["k_after"] - 6.0) <= 0.5, info
+    assert cfg.router_temp > 1.0, info
+    # persistence: config roundtrip keeps the calibrated temperature
+    rt = float(cfg.router_temp)
+    rt2 = SpeakerConfig(**{k: v for k, v in cfg.to_dict().items()
+                           if k != "gated_layers"}).router_temp
+    assert rt2 == rt, (rt, rt2)
+    print(f"[PASS] router temp calibration (moe) temp {rt:.3f} "
+          f"k0 {info['k_before']:.1f} -> {info['k_after']:.1f} (target 6)")
+
+
 def test_weighted_residual_onehot():
     """moe: under one-hot routing only the selected gated layer executes and w=1 (full
     residual), the rest stay identity; soft weight mixing is correct."""
@@ -305,7 +444,7 @@ def test_weighted_residual_onehot():
                 hs = hs + layer.mlp(hs) * 0.1  # FakeDecoderLayer: h + mlp(h)*0.1, w=1
         expect = fake.lm_head(hs)
         assert torch.allclose(out, expect, atol=1e-4), f"slot {slot} weighted residual mismatch"
-    # soft selection with renormalized probabilities: medium bias, manual replay (top-p selection + renorm)
+    # soft selection with pmax weights: medium bias, manual replay (top-p selection + p/p_max)
     mod.joint_router.net.weight.data.zero_()
     mod.joint_router.layer_bias.data = torch.tensor([2.0, 1.0, 0.0, 0.0])
     x = torch.randn(1, 3, h)
@@ -317,7 +456,7 @@ def test_weighted_residual_onehot():
         cum = sp.cumsum(-1)
         cnt = int((cum < 0.9).sum().item()) + 1  # first position where cum>=p = prefix length
         wsel = torch.zeros_like(w)
-        wsel[oi[:cnt]] = w[oi[:cnt]] / w[oi[:cnt]].sum()
+        wsel[oi[:cnt]] = w[oi[:cnt]] / w[oi[:cnt]].max()
         for i, layer in enumerate(inner):
             if cfg.is_always_on(i):
                 hs = layer(hs)[0]
@@ -577,11 +716,14 @@ def test_resume_gate_pt():
 if __name__ == "__main__":
     test_config()
     test_config_from_json()
+    test_decode_recipe()
     test_router()
     test_joint_router()
     test_select_top_p()
     test_budget_threshold()
     test_budget_moe()
+    test_budget_lambda_map()
+    test_router_temp_calib()
     test_weighted_residual_onehot()
     test_sparse_cache_threshold()
     test_sparse_cache_moe()

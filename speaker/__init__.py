@@ -17,7 +17,7 @@ MoDConfig/MoDLayerWrapper/MoDModelWrapper/convert_to_mod are import aliases.
 """
 from .config import SpeakerConfig
 from .gating import Router, JointRouter, RouteDecision, select_and_weight, GatingOutput
-from .wrapper import SpeakerLayerWrapper, SpeakerModelWrapper, convert_to_speaker
+from .wrapper import SpeakerLayerWrapper, SpeakerModelWrapper, convert_to_speaker, apply_decode_config
 from .scheduler import LayerScheduler
 from .metrics import per_token_nll, per_token_correct, estimate_act_mb, distill_kl_loss
 

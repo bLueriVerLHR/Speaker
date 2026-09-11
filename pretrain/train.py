@@ -42,8 +42,10 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from speaker import SpeakerConfig, convert_to_speaker  # noqa: E402
-from speaker.metrics import estimate_act_mb, per_token_correct  # noqa: E402
+from speaker.metrics import estimate_act_mb  # noqa: E402
 from speaker.evaluate import ema_update, eval_heldout  # noqa: E402
+from speaker.ruler import batch_accuracy  # noqa: E402 (P0: one accuracy scale everywhere)
+from speaker.dual import DualController  # noqa: E402 (P0.5: one dual orchestration point)
 from speaker.log import RunLogger  # noqa: E402
 from speaker.checkpoint import save_clean_base, save_gate  # noqa: E402
 from speaker.train_common import (  # noqa: E402
@@ -85,11 +87,13 @@ def parse_args():
                    help="explicit list of fixed layers (comma-separated), overrides shared_head/tail")
     # Gating/budget (same Speaker mechanism as finetune, gate_mode dual scheme)
     p.add_argument("--kmax", type=int, default=10)
-    p.add_argument("--gate_mode", default="moe", choices=["moe", "threshold"],
+    p.add_argument("--gate_mode", default="moe", choices=["moe", "mol", "threshold", "speaker"], metavar="SCHEME",
                    help="moe=hierarchical MoE joint routing (default mainline) / threshold=legacy per-layer threshold gating")
     p.add_argument("--select_mode", default="topp", choices=["topp", "topk"])
     p.add_argument("--top_p", type=float, default=0.9)
     p.add_argument("--top_k", type=int, default=6)
+    p.add_argument("--weight_mode", default="pmax", choices=["pmax", "renorm"],
+                   help="moe residual weighting: pmax (ed7 fix, default) / renorm (legacy)")
     p.add_argument("--min_layers", type=int, default=1)
     p.add_argument("--temp_affinity", type=float, default=1.0)
     p.add_argument("--ta_end", type=float, default=0.3)
@@ -98,7 +102,9 @@ def parse_args():
     p.add_argument("--sparsity_price", type=float, default=0.03)
     p.add_argument("--price_adapt", default=False, action=argparse.BooleanOptionalAction,
                    help="early in from-scratch training acc is meaningless, dual adjustment off by default, lambda+kmax serve as the backstop")
-    p.add_argument("--acc_target", type=float, default=None)
+    p.add_argument("--acc_target", type=float, default=None,
+                   help="absolute floor for the dual (numeric only: the from-scratch dense reference is a "
+                        "random init, so the finetune-style 'auto' derivation is meaningless here)")
     p.add_argument("--price_warmup", type=int, default=100)
     p.add_argument("--budget_ramp", type=int, default=100)
     p.add_argument("--cos_reg_coef", type=float, default=0.01)
@@ -156,6 +162,7 @@ def main():
     overrides = dict(kmax=args.kmax, gate_mode=args.gate_mode,
                      select_mode=args.select_mode, top_p=args.top_p,
                      top_k=args.top_k, min_layers=args.min_layers,
+                     weight_mode=args.weight_mode,
                      always_on_head=args.shared_head,
                      always_on_tail=args.shared_tail, temp_affinity=args.temp_affinity,
                      gumbel_scale=args.gumbel_scale, sparsity_price=args.sparsity_price,
@@ -186,7 +193,7 @@ def main():
     rl = RunLogger(args.save_dir)
     step = 0
     ema_lm = None
-    ema_acc = None
+    dual = DualController(mod_model, cfg)  # accuracy dual: ema + warmup gate + λ adaptation
     window_t0 = time.time()
     window_tokens = 0
     mod_model.train()
@@ -200,17 +207,13 @@ def main():
             lm_loss = out.loss
             aux = mod_model.get_aux_loss()
             with torch.no_grad():
-                correct = per_token_correct(out.logits.float(), b["labels"])
-                valid_tok = (b["labels"] != -100)
-                acc_item = correct[valid_tok].float().mean().item() if valid_tok.any() else 0.0
+                acc_item = batch_accuracy(out.logits, b)
             task = mod_model.get_budget_loss(b["attention_mask"])
             if task is not None and args.budget_ramp > 0 and step < args.budget_ramp:
                 task = task * (step / args.budget_ramp)
             loss = lm_loss + (aux or 0) + (task or 0)
             ema_lm = ema_update(ema_lm, lm_loss.item())
-            ema_acc = ema_update(ema_acc, acc_item)
-            if step > cfg.price_warmup_steps:
-                mod_model.adapt_price(ema_acc)
+            ema_acc = dual.observe(step, acc_item)
             with torch.no_grad():
                 counts = mod_model.get_active_counts()
                 valid = b["attention_mask"].bool()
@@ -263,7 +266,7 @@ def main():
     print(f"saved to {args.save_dir} (clean base+tokenizer+mod_config.json+gate.pt)", flush=True)
     if eval_texts:
         mod_model.set_skip_mode("hard")
-        res = eval_heldout(mod_model, eval_texts, coll_fn)
+        res = eval_heldout(mod_model, eval_texts, coll_fn, valid_mode="labels")
         print(f"heldout (hard): loss {res['loss']:.3f} acc {res['acc']:.3f} "
               f"| k {res['mean_k']:.1f}±{res['std_k']:.1f} "
               f"quartile {[round(v, 1) for v in res['quartile_k']]}", flush=True)

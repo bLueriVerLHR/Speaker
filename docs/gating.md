@@ -7,6 +7,16 @@ enters the loss*. Checkpoints of one mode do not load in the other (`gate.pt` ke
 sets are disjoint); `mod_config.json` records the mode, and a missing `gate_mode`
 field (old checkpoints) is inferred as `threshold`.
 
+**Scheme names (and CLI aliases)**:
+
+| Scheme | Canonical `gate_mode` | CLI alias | Decides |
+|---|---|---|---|
+| **Speaker** | `threshold` | `--gate_mode speaker` | each layer independently (per-layer gate) |
+| **MoL** (Mixture of Layers) | `moe` | `--gate_mode mol` | one joint router for the whole gated region |
+
+Aliases are normalized to the canonical values in `SpeakerConfig.__post_init__`,
+so checkpoints stay bit-compatible with the historical `threshold`/`moe` formats.
+
 ---
 
 ## moe — joint routing over layers (default mainline)
@@ -28,6 +38,20 @@ The entry layer computes the route once per forward pass and stores it in the
 model hub; every other gated layer consumes its own slice (`_consume_route`),
 re-aligned to that layer's device in mixed CPU/GPU placement.
 
+### Init calibration (router temperature)
+
+A randomly initialized `JointRouter` over large-norm hidden states (7B) starts
+**peaked**: the initial top-p mean k lands far below the near-dense start the
+threshold scheme gets from `calibrate_tau`. Training from such a start collapses
+during the budget ramp (r7: k sank 4.9→1.7, accuracy never took off — the STE
+soft-inclusion saturates and the dual price cannot reopen gates it already
+stopped pressing). `calibrate_router_temp` (finetune `--router_calib_batches`,
+0 = legacy off) caches entry hiddens from a few batches and bisects a persistent
+logit temperature (`router_temp`, stored in `mod_config.json`, never in
+`gate.pt` — key sets unchanged; 1.0 = bit-for-bit identity) until the initial
+mean k reaches the target (`--router_start_k`, default ≈ 0.6·G). Only flattening
+is applied: a start that is already dense enough is left untouched.
+
 ### Selection: top-p (k adapts per token)
 
 Layers are sorted by probability; the smallest prefix whose cumulative probability
@@ -42,12 +66,21 @@ term is disabled (`budget=None`) since k is not something the loss can steer.
 
 ### Weighted residual
 
-Selected layer probabilities are renormalized into weights `w`, and each selected
-layer is applied as a weighted residual:
+Selected layer probabilities become residual weights `w` (`weight_mode`, ed7),
+and each selected layer is applied as a weighted residual:
 
 ```
 h ← h + w_l · (F_l(h) − h)        for l in S(t)
 ```
+
+- `pmax` (default): `w = p / p_max` — the top layer carries 1.0, the rest
+  proportionally. Total gain scales *with* k (each opened layer adds up to a
+  full-strength residual, as in the threshold scheme), the all-selected limit is
+  exactly the dense forward, and the dual's "buy layers back" lever works.
+- `renorm` (legacy): `w = p / Σ_selected p` (Σw = 1). Total gain is fixed at
+  1.0 whatever k is: opening a layer dilutes the good layers (the LM loss itself
+  pushes k down), and relaxing λ cannot buy accuracy back — the r7 collapse
+  (init lm 13.2/acc 0.01, 4000 steps only back to acc 0.24 at λ floor).
 
 Skipped layers cost nothing: pass-through, and at decode they write no K/V.
 
@@ -123,7 +156,7 @@ k-capped choices (threshold).
 | `kmax` | both | hard cap on per-token k |
 | `gumbel_scale` | threshold | Gumbel noise scale while training the gate |
 | `always_on_layers` | both | `None` = derive (head/tail prior); `[]` = pure gating (gating-first mainline); list = explicit fixed set |
-| `sparsity_price` (λ), `acc_target` | both | dual-budget knobs (docs/training.md) |
+| `sparsity_price` (λ), `acc_target` | both | dual-budget knobs: `acc_target` = `auto` (default, dense-referenced) / float / `none` (docs/training.md) |
 
 Checkpoint formats: moe `gate.pt` stores `joint_router.*` only; threshold stores
 per-layer `router/tau/comp` (+ LoRA if used). `speaker/checkpoint.py` filters

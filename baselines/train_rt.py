@@ -14,23 +14,23 @@ Sandbox adaptations (beyond the paper, noted): same data same slice plain full-t
 held-out scoring eval from the same distribution (the paper uses LM-Harness downstream tasks); everything trains to convergence (StopOnPlateau).
 Differences vs ours: gating mechanism / frozen base / attention granularity (ours is the whole layer).
 
-Mechanisms (layer forward/patch/stats/eval) live in baselines/lib.py; this file keeps only the CLI and the training loop.
+Mechanisms (layer forward/patch/stats/eval) live in baselines/lib.py; the training loop lives in
+baselines/train_loop.py (P1 shared template); this file keeps the CLI + the family recipe.
 """
 import argparse
 import json
 import os
+import random
 import sys
-import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from baselines.lib import collect_rt_stats, eval_heldout_rt, patch_model_rt  # noqa: E402
+from baselines.train_loop import BaselineRecipe, run_baseline_training  # noqa: E402
 from speaker.checkpoint import gate_state_dict  # noqa: E402
 from speaker.evaluate import ema_update  # noqa: E402
-from speaker.converge import StopOnPlateau  # noqa: E402 (ed3 unified convergence rule)
 from speaker.train_common import build_model, build_tok, resolve_device, split_train_eval  # noqa: E402
 from data.sft import make_collate  # noqa: E402
 
@@ -48,16 +48,77 @@ def parse_args():
     p.add_argument("--eval_samples", type=int, default=100)
     p.add_argument("--granularity", default="attn_sequence",
                    help="paper default: Attention+sequence level (§5.2); block/mlp/token also explored in the paper")
-    p.add_argument("--rt_target", type=float, default=0.5, help="target execution rate s (paper main experiments 50%)")
+    p.add_argument("--rt_target", type=float, default=0.5, help="target execution rate s (paper main experiments 50%%)")
     p.add_argument("--rt_scale", type=float, default=0.01,
                    help="capacity loss weight λ (middle of the paper grid {0,0.1,0.01,0.001}; official default 0 = unconstrained)")
     p.add_argument("--log_interval", type=int, default=10)
     p.add_argument("--save_dir", default="/tmp/rt_baseline")
+    p.add_argument("--seed", type=int, default=None,
+                   help="random seed (unset by default, preserving legacy behavior)")
+    p.add_argument("--patience", type=int, default=3,
+                   help="StopOnPlateau patience (enlarge to guarantee running to --max_steps)")
     return p.parse_args()
+
+
+class RtRecipe(BaselineRecipe):
+    """Router-Tuning family strategy: frozen base, routers-only training,
+    loss = LM + Σ capacity loss (upstream math)."""
+
+    def __init__(self, model, gated, is_mod, n_dense, coll_eval, dense_res):
+        self.model, self.gated, self.is_mod = model, gated, is_mod
+        self.n_dense = n_dense
+        self.coll_eval, self.d = coll_eval, dense_res
+        self.ema_cap = None
+        self._cap = 0.0
+        self._mloss = None
+        self.routers = [p for nm, p in model.named_parameters() if "router" in nm]
+
+    def loss_term(self, b, out, args):
+        cap, mod_loss = collect_rt_stats(self.gated, training=True)
+        self._cap, self._mloss = cap, mod_loss
+        self.ema_cap = ema_update(self.ema_cap, cap)
+        return mod_loss
+
+    def clip_params(self):
+        return self.routers
+
+    def log_line(self, step, lm, ema_lm, rate, mem, elapsed, args):
+        k_est = self.n_dense + len(self.gated) * self._cap
+        # historical rt format: no [HH:MM:SS] prefix
+        return (f"step {step:4d}/{args.max_steps} lm {lm.item():.3f} ema {ema_lm:.3f} "
+                f"cap {self._mloss.item() if self._mloss is not None else 0:.3f} "
+                f"exec {self._cap:.2f}/{self.ema_cap:.2f} k_est {k_est:.1f} {rate:.0f}tok/s{mem} "
+                f"{elapsed:.0f}s")
+
+    def eval_model(self, model, texts):
+        return eval_heldout_rt(model, self.gated, texts, self.coll_eval,
+                               n_always=self.n_dense)
+
+    def converge_row(self, chk):
+        return {"exec": chk["exec_rate"]}
+
+    def save(self, model, tok, args, step, stopper):
+        torch.save({k: v.cpu() for k, v in gate_state_dict(model.state_dict()).items()},
+                   os.path.join(args.save_dir, "routers.pt"))
+        with open(os.path.join(args.save_dir, "rt_config.json"), "w") as f:
+            json.dump({"is_mod": self.is_mod, "granularity": args.granularity, "threshold": 0.5,
+                       "target": args.rt_target, "scale": args.rt_scale,
+                       "converged_step": step, "best_subset_loss": stopper.best}, f)
+
+    def final_line(self, m, args):
+        d, mm = self.d, m
+        k_m = self.n_dense + len(self.gated) * (mm["exec_rate"] or 0)
+        return (f"heldout | dense loss {d['loss']:.3f} acc {d['acc']:.3f} "
+                f"| rt loss {mm['loss']:.3f} acc {mm['acc']:.3f} "
+                f"(Δloss {mm['loss'] - d['loss']:+.3f} Δacc {mm['acc'] - d['acc']:+.3f}) "
+                f"| exec {mm['exec_rate']:.2f} k_est {k_m:.1f}")
 
 
 def main():
     args = parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     tok = build_tok(args.model_id)
     model = build_model(args.model_id, device)
@@ -96,69 +157,8 @@ def main():
           f"exec {init['exec_rate']:.2f}", flush=True)
 
     opt = torch.optim.AdamW([{"params": routers, "lr": args.lr}], weight_decay=0.0)
-    dl = DataLoader(full, batch_size=1, shuffle=True, collate_fn=coll_fn)
-    os.makedirs(args.save_dir, exist_ok=True)
-    stopper = StopOnPlateau(max_steps=args.max_steps)  # ed5: --max_steps now actually wired into the cap (was cosmetic-only)
-    stop_subset = eval_texts[:40]  # subset for plateau checks (saves time); final eval still uses the full set
-    step, ema_lm, ema_cap = 0, None, None
-    t0 = time.time()
-    window_tokens, window_t0 = 0, time.time()
-    model.train()
-    for epoch in range(1000):
-        for b in dl:
-            step += 1
-            if stopper.capped(step):
-                break
-            out = model(**b)
-            cap, mod_loss = collect_rt_stats(gated, training=True)
-            lm = out.loss
-            loss = lm + (mod_loss if mod_loss is not None else 0)  # upstream math: LM + Σrelu(cap-target)*scale
-            ema_lm = ema_update(ema_lm, out.loss.item())
-            ema_cap = ema_update(ema_cap, cap)
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(routers, 1.0)
-            opt.step()
-            window_tokens += int(b["attention_mask"].sum())
-            if step % args.log_interval == 0:
-                k_est = n_dense + n_gated * cap
-                rate = window_tokens / max(time.time() - window_t0, 1e-6)
-                mem = (f" mem {torch.cuda.memory_allocated(device) / 1024**3:.2f}GB"
-                       if device.type == "cuda" else "")
-                window_tokens, window_t0 = 0, time.time()
-                print(f"step {step:4d}/{args.max_steps} lm {lm.item():.3f} ema {ema_lm:.3f} "
-                      f"cap {mod_loss.item() if mod_loss is not None else 0:.3f} "
-                      f"exec {cap:.2f}/{ema_cap:.2f} k_est {k_est:.1f} {rate:.0f}tok/s{mem} "
-                      f"{time.time() - t0:.0f}s", flush=True)
-            if step % stopper.eval_every == 0:
-                # plateau check (eval_heldout_rt restores train mode automatically)
-                chk = eval_heldout_rt(model, gated, stop_subset, coll_eval, n_always=n_dense)
-                with open(os.path.join(args.save_dir, "converge.jsonl"), "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"step": step, "subset_loss": chk["loss"],
-                                        "best": stopper.best, "ema_lm": ema_lm,
-                                        "exec": chk["exec_rate"]}) + "\n")
-                if stopper.check(step, chk["loss"]):
-                    print(f"[converged] step {step}, best heldout-subset loss {stopper.best:.3f}",
-                          flush=True)
-                    break
-            if stopper.capped(step):
-                break
-        if stopper.capped(step):
-            break
-
-    torch.save({k: v.cpu() for k, v in gate_state_dict(model.state_dict()).items()},
-               os.path.join(args.save_dir, "routers.pt"))
-    with open(os.path.join(args.save_dir, "rt_config.json"), "w") as f:
-        json.dump({"is_mod": is_mod, "granularity": args.granularity, "threshold": 0.5,
-                   "target": args.rt_target, "scale": args.rt_scale,
-                   "converged_step": step, "best_subset_loss": stopper.best}, f)
-    print(f"saved to {args.save_dir}", flush=True)
-    m = eval_heldout_rt(model, gated, eval_texts, coll_eval, n_always=n_dense)
-    k_m = n_dense + n_gated * (m["exec_rate"] or 0)
-    print(f"heldout | dense loss {d['loss']:.3f} acc {d['acc']:.3f} "
-          f"| rt loss {m['loss']:.3f} acc {m['acc']:.3f} "
-          f"(Δloss {m['loss'] - d['loss']:+.3f} Δacc {m['acc'] - d['acc']:+.3f}) "
-          f"| exec {m['exec_rate']:.2f} k_est {k_m:.1f}", flush=True)
+    recipe = RtRecipe(model, gated, is_mod, n_dense, coll_eval, d)
+    run_baseline_training(args, model, tok, full, eval_texts, coll_fn, device, opt, recipe)
 
 
 if __name__ == "__main__":

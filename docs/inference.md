@@ -2,6 +2,21 @@
 
 Three composable modes, from "enough memory" to "edge-side budgeted".
 
+## Primary efficiency metric — per-token memory demand
+
+Wall-clock at batch size 1 does not reflect the savings (wrapper overhead ~12%
+eats the FLOP gap; r4/r7 both re-confirmed). The honest currency is **demand**:
+what a token's execution actually requires,
+
+- **weights**: `k × bytes-per-layer` (GB/token; 7B reference: dense 13.05 vs
+  Speaker 7.11 at k=15.3/28 → −46%),
+- **KV cache**: `k × bytes-per-layer-KV` at the serving context length
+  (MB/token; 31.2 vs 57.3 at 1024 ctx → −46%).
+
+`tools/mem_demand.py` aggregates this from `probe_kdist` JSONs. Process-level
+`peak_gb/avg_gb` from sequential single-process evals is allocator-polluted and
+stays diagnostic-only. Demand is also what the scheduler below budgets against.
+
 ## Mode 1 — hard skipping + sparse KV cache (speed)
 
 ```python
