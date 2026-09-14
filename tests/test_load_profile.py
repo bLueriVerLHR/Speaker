@@ -1,14 +1,9 @@
 """Load-profiling toolchain self-tests (no real weights needed): load -> shared-layer
 promotion / greedy placement / profiling -> promotion -> reload loop (dual scheme)."""
 import os
-import pathlib
-import sys
 import tempfile
 
 import torch
-import torch.nn as nn
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from speaker import SpeakerConfig, convert_to_speaker
 from speaker.load_profile import (
     estimate_layer_bytes,
@@ -19,32 +14,7 @@ from speaker.load_profile import (
 )
 
 
-class FakeDecoderLayer(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.self_attn = nn.Identity()
-        self.mlp = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.SiLU(),
-                                 nn.Linear(hidden_size, hidden_size))
-
-    def forward(self, hidden_states, attention_mask=None, **kwargs):
-        out = hidden_states + self.mlp(hidden_states) * 0.1
-        return (out,)
-
-
-class FakeHF(nn.Module):
-    def __init__(self, n=6, h=32):
-        super().__init__()
-        self.config = type("Cfg", (), {"num_hidden_layers": n, "hidden_size": h})()
-        self.model = type("M", (), {})()
-        self.model.layers = nn.ModuleList([FakeDecoderLayer(h) for _ in range(n)])
-        self.lm_head = nn.Linear(h, 100)
-
-    def forward(self, hidden_states=None, input_ids=None, attention_mask=None, **kwargs):
-        if hidden_states is None:
-            hidden_states = torch.randn(2, 8, 32)
-        for layer in self.model.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask, **kwargs)[0]
-        return {"logits": self.lm_head(hidden_states)}
+from tests._fakes import FakeHF
 
 
 def test_select_fixed_layers():
@@ -68,7 +38,6 @@ def test_select_fixed_layers():
         raise AssertionError("should reject an invalid threshold")
     except ValueError:
         pass
-    print("[PASS] select_fixed_layers")
 
 
 def test_plan_placement():
@@ -91,7 +60,6 @@ def test_plan_placement():
     plan4 = plan_placement(load, layer_bytes2, 350, always_on=[0, 5])
     assert plan4["gpu_layers"] == [0, 3, 4, 5], plan4  # 1 (0.9) does not fit and is skipped
     assert plan4["cpu_layers"] == [1, 2], plan4
-    print("[PASS] plan_placement")
 
 
 def test_profile_and_promote_threshold():
@@ -140,7 +108,6 @@ def test_profile_and_promote_threshold():
         assert not gate_missing and not unexp, (gate_missing, unexp)
         assert mod2.layers[promoted[0]].is_always_on
         assert mod2.layers[3].router is not None
-    print("[PASS] profile+promote roundtrip (threshold)")
 
 
 def test_profile_and_promote_moe():
@@ -187,7 +154,6 @@ def test_profile_and_promote_moe():
         mod2.set_skip_mode("soft")
         load2 = profile_layer_load(mod2, batches[:1])
         assert set(load2) == set(range(n))
-    print("[PASS] profile+promote roundtrip (moe)")
 
 
 def test_estimate_layer_bytes():
@@ -201,13 +167,3 @@ def test_estimate_layer_bytes():
     mod_m = convert_to_speaker(FakeHF(), SpeakerConfig(num_hidden_layers=6, hidden_size=32))
     lb_m = estimate_layer_bytes(mod_m)
     assert lb_m[0] == lb_m[2] == lb_m[4], (lb_m[0], lb_m[2], lb_m[4])
-    print("[PASS] estimate_layer_bytes (both modes)")
-
-
-if __name__ == "__main__":
-    test_select_fixed_layers()
-    test_plan_placement()
-    test_profile_and_promote_threshold()
-    test_profile_and_promote_moe()
-    test_estimate_layer_bytes()
-    print("\nAll load-profile tests passed.")

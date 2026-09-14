@@ -16,6 +16,8 @@ import re
 
 import torch
 
+from .log import logger
+
 # Gating key markers: "router" covers both per-layer router.* and moe's joint_router.*
 GATE_KEY_MARKS = ("router", "tau", "comp")
 
@@ -49,12 +51,32 @@ def clean_base_state_dict(mod_model) -> dict:
             for k, v in mod_model.hf_model.state_dict().items() if is_base_key(k)}
 
 
-def save_gate(mod_model, save_dir: str, extra_marks=(), filename: str = "gate.pt") -> dict:
-    """Saves only gating (+ optional lora) keys; returns the saved state_dict."""
+def save_gate(mod_model, save_dir: str, extra_marks=(), filename: str = "gate.pt",
+              fmt: str = "pt") -> dict:
+    """Saves only gating (+ optional lora) keys; returns the saved state_dict.
+
+    fmt: "pt" (default, legacy pickle, bit-compatible reruns) | "safetensors"
+    (requires the safetensors package; safer for sharing, no pickle). The
+    filename extension follows fmt unless an explicit filename is given.
+    load_gate auto-detects either file, so readers need no flag.
+    """
     os.makedirs(save_dir, exist_ok=True)
     sd = {k: v.cpu() for k, v in
           gate_state_dict(mod_model.state_dict(), extra_marks).items()}
-    torch.save(sd, os.path.join(save_dir, filename))
+    if fmt == "safetensors":
+        try:
+            from safetensors.torch import save_file
+        except ImportError as e:
+            raise ImportError(
+                "safetensors format requested but the 'safetensors' package is "
+                "not installed; use fmt='pt' (default) or pip install safetensors") from e
+        if filename == "gate.pt":
+            filename = "gate.safetensors"
+        save_file(sd, os.path.join(save_dir, filename))
+    elif fmt == "pt":
+        torch.save(sd, os.path.join(save_dir, filename))
+    else:
+        raise ValueError(f"fmt must be pt|safetensors, got {fmt!r}")
     return sd
 
 
@@ -68,18 +90,41 @@ def save_clean_base(mod_model, tok=None, cfg=None, save_dir: str = "."):
         cfg.to_json(os.path.join(save_dir, "mod_config.json"))
 
 
+def _resolve_gate_file(ckpt_dir: str, filename: str) -> str:
+    """Auto-detects gate.pt vs gate.safetensors: an explicit existing filename wins;
+    otherwise a gate.pt request falls back to a sibling gate.safetensors (and vice
+    versa), so writers and readers never need to agree on a flag."""
+    path = os.path.join(ckpt_dir, filename)
+    if os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(filename)
+    alt = stem + (".safetensors" if ext == ".pt" else ".pt")
+    alt_path = os.path.join(ckpt_dir, alt)
+    return alt_path if os.path.exists(alt_path) else path
+
+
 def load_gate(mod_model, ckpt_dir: str, filename: str = "gate.pt"):
     """Loads gate.pt (strict=False, returns (missing, unexpected) for the caller to
     assert/print). Warns loudly when gating/LoRA keys end up missing — the silent
     strict=False drop historically masked wrong-scheme ckpts and unwrapped LoRA
     (r1 pitfall: eval quietly scored a half-initialized model)."""
-    sd = torch.load(os.path.join(ckpt_dir, filename), map_location="cpu")
+    path = _resolve_gate_file(ckpt_dir, filename)
+    if path.endswith(".safetensors"):
+        try:
+            from safetensors.torch import load_file
+        except ImportError as e:
+            raise ImportError(
+                f"{path} needs the 'safetensors' package to load; "
+                "pip install safetensors or use a gate.pt ckpt") from e
+        sd = load_file(path, device="cpu")
+    else:
+        sd = torch.load(path, map_location="cpu")
     missing, unexp = mod_model.load_state_dict(sd, strict=False)
     gate_missing = [k for k in missing if is_gate_key(k) or "lora_" in k]
     if gate_missing:
-        print(f"WARNING: {len(gate_missing)} gating/LoRA keys missing after loading "
-              f"{filename} (e.g. {gate_missing[:3]}); ckpt scheme or LoRA spec likely "
-              f"mismatched — those gates silently run at fresh initialization", flush=True)
+        logger.warning(f"{len(gate_missing)} gating/LoRA keys missing after loading "
+                       f"{filename} (e.g. {gate_missing[:3]}); ckpt scheme or LoRA spec likely "
+                       f"mismatched — those gates silently run at fresh initialization")
     return missing, unexp
 
 

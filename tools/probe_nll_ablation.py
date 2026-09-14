@@ -13,47 +13,21 @@ Premise holds iff dNLL concentrates in the top (hard) quartile, growing with dos
 
 Output JSON: per-config mean dNLL overall + per quartile + Q4/Q1 ratio + r(dnll, base_nll).
 """
-import argparse
-import gc
-import json
 import pathlib
 import sys
+from typing import Annotated
 
 import torch
+import typer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from data.sft import make_collate
-from speaker.metrics import per_token_nll
+from speaker.evaluate import chunked_nll_correct
+from speaker.log import logger
 from speaker.train_common import build_model, build_tok, eval_slice, resolve_device
+from tools._common import dump_json, find_layers, passthrough_hook, pearson_r, quartile_means
 
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_id", default="/home/hdd/model/Qwen2.5-7B-Instruct")
-    p.add_argument("--data_path", default="./data/sft_t2t_mini.jsonl")
-    p.add_argument("--offset", type=int, default=5000)
-    p.add_argument("--n", type=int, default=60)
-    p.add_argument("--max_len", type=int, default=256)
-    p.add_argument("--device", default="cuda:0")
-    p.add_argument("--gated_span", default="2,25", help="inclusive layer range probed")
-    p.add_argument("--doses", default="4,8,12", help="random-set sizes")
-    p.add_argument("--seeds", type=int, default=2)
-    p.add_argument("--nll_cache", default="/tmp/opencode/nll_cache.pt",
-                   help="optional: sanity-check our baseline against this cache")
-    p.add_argument("--out", default="/tmp/diff_ablation.json")
-    return p.parse_args()
-
-
-def find_layers(model):
-    for path in (["model", "layers"], ["transformer", "h"], ["layers"]):
-        cur = model
-        try:
-            for a in path:
-                cur = getattr(cur, a)
-            return cur
-        except AttributeError:
-            pass
-    raise ValueError("layers not found")
+app = typer.Typer(add_completion=False)
 
 
 def run_nll(model, batches):
@@ -61,9 +35,10 @@ def run_nll(model, batches):
     outs = []
     with torch.no_grad():
         for b in batches:
-            nll = per_token_nll(model(**b).logits.float(), b["labels"])[0]
+            nll, _ = chunked_nll_correct(model(**b).logits, b["labels"])
             valid = (b["labels"] != -100)[0]
-            outs.append((b["input_ids"][0][valid].cpu(), nll[valid].cpu()))
+            outs.append((b["input_ids"][0][valid].cpu(), nll[0][valid].cpu()))
+            del nll
     return outs
 
 
@@ -71,61 +46,63 @@ def summarize(dnll, base, name):
     finite = torch.isfinite(dnll)
     frac_bad = float((~finite).float().mean())
     d, b = dnll[finite], base[finite]
-    qs = base.quantile(torch.tensor([0.25, 0.5, 0.75]))
-    edges = [float("-inf")] + [float(q) for q in qs] + [float("inf")]
-    by_q = []
-    for i in range(4):
-        sel = (b > edges[i]) & (b <= edges[i + 1])
-        by_q.append(round(float(d[sel].mean()), 4) if sel.any() else None)
-    dc = d - d.mean()
-    bc = b - b.mean()
-    r = float((dc * bc).sum() / (dc.pow(2).sum() * bc.pow(2).sum()).sqrt().clamp_min(1e-12))
+    by_q = quartile_means(d, b, ndigits=4)
+    r = pearson_r(d, b)
     ratio = (by_q[3] / by_q[0]) if by_q[0] and abs(by_q[0]) > 1e-6 else None
     row = {"config": name, "dnll_mean": round(float(d.mean()), 4),
            "dnll_by_nll_quartile_q1e_q4h": by_q,
            "q4_q1_ratio": round(ratio, 3) if ratio is not None else None,
            "r_dnll_basenll": round(r, 4), "frac_nonfinite": round(frac_bad, 5)}
-    print(f"[{name}] dnll {row['dnll_mean']:+.4f} q={[f'{v:+.3f}' if v is not None else '-' for v in by_q]} "
-          f"Q4/Q1 {row['q4_q1_ratio']} r {row['r_dnll_basenll']:+.3f}", flush=True)
+    logger.info(f"[{name}] dnll {row['dnll_mean']:+.4f} q={[f'{v:+.3f}' if v is not None else '-' for v in by_q]} "
+                f"Q4/Q1 {row['q4_q1_ratio']} r {row['r_dnll_basenll']:+.3f}")
     return row
 
 
-def main():
-    args = parse_args()
-    device = resolve_device(args.device)
-    tok = build_tok(args.model_id)
-    texts = eval_slice(args.data_path, args.offset, args.n)
-    coll = make_collate(tok, device, args.max_len)
+@app.command()
+def main(
+    model_id: Annotated[str, typer.Option("--model_id")] = "/home/hdd/model/Qwen2.5-7B-Instruct",
+    data_path: Annotated[str, typer.Option("--data_path")] = "./data/sft_t2t_mini.jsonl",
+    offset: Annotated[int, typer.Option("--offset")] = 5000,
+    n: Annotated[int, typer.Option("--n")] = 60,
+    max_len: Annotated[int, typer.Option("--max_len")] = 256,
+    device: Annotated[str, typer.Option("--device")] = "cuda:0",
+    gated_span: Annotated[str, typer.Option("--gated_span", help="inclusive layer range probed")] = "2,25",
+    doses: Annotated[str, typer.Option("--doses", help="random-set sizes")] = "4,8,12",
+    seeds: Annotated[int, typer.Option("--seeds")] = 2,
+    nll_cache: Annotated[str, typer.Option("--nll_cache", help="optional: sanity-check our baseline against this cache")] = "/tmp/opencode/nll_cache.pt",
+    out: Annotated[str, typer.Option("--out")] = "/tmp/diff_ablation.json",
+) -> None:
+    """Depth-dosage premise test: does depth differentially help hard tokens?"""
+    from speaker.terminal import setup_terminal
+    setup_terminal()
+    device = resolve_device(device)
+    tok = build_tok(model_id)
+    texts = eval_slice(data_path, offset, n)
+    coll = make_collate(tok, device, max_len)
     batches = [coll([t]) for t in texts]
 
-    model = build_model(args.model_id, device)
+    model = build_model(model_id, device)
     model.eval()
     layers = find_layers(model)
     N = len(layers)
-    lo, hi = (int(x) for x in args.gated_span.split(","))
+    lo, hi = (int(x) for x in gated_span.split(","))
     span = list(range(lo, hi + 1))
-    doses = [int(x) for x in args.doses.split(",")]
+    doses = [int(x) for x in doses.split(",")]
 
     base = run_nll(model, batches)
     ids = [s[0] for s in base]
     base_all = torch.cat([s[1] for s in base])
-    print(f"baseline pooled nll mean {float(base_all.mean()):.4f}  ntok {base_all.numel()}  N={N}",
-          flush=True)
-    if args.nll_cache:
-        cache = torch.load(args.nll_cache, map_location="cpu", weights_only=True)
+    logger.info(f"baseline pooled nll mean {float(base_all.mean()):.4f}  ntok {base_all.numel()}  N={N}")
+    if nll_cache:
+        cache = torch.load(nll_cache, map_location="cpu", weights_only=True)
         same = all(torch.equal(cache["ids"][i], ids[i]) for i in range(len(ids)))
         cb = torch.cat([c for c in cache["nll"]])
-        print(f"cache ids aligned: {same}; cached nll mean {float(cb.mean()):.4f}", flush=True)
+        logger.info(f"cache ids aligned: {same}; cached nll mean {float(cb.mean()):.4f}")
 
     rows = []
 
     def with_skip(skips, name):
-        hooks = []
-        for i in skips:
-            def _skip(module, margs, output, _i=i):
-                hs = margs[0] if margs else output[0]
-                return (hs,) + tuple(output[1:]) if isinstance(output, tuple) else hs
-            hooks.append(layers[i].register_forward_hook(_skip))
+        hooks = [layers[i].register_forward_hook(passthrough_hook) for i in skips]
         abl = run_nll(model, batches)
         for h in hooks:
             h.remove()
@@ -136,17 +113,17 @@ def main():
         with_skip([i], f"drop_L{i}")
 
     for m in doses:  # depth dosage: random mid-layer sets
-        for seed in range(args.seeds):
+        for seed in range(seeds):
             g = torch.Generator().manual_seed(1234 + m * 100 + seed)
             picks = sorted(torch.randperm(len(span), generator=g)[:m].tolist())
             picks = [span[j] for j in picks]
             with_skip(picks, f"dose_m{m}_s{seed}")
 
-    with open(args.out, "w") as f:
-        json.dump({"args": vars(args), "baseline_nll_mean": float(base_all.mean()),
-                   "rows": rows}, f, indent=1)
-    print(f"saved {args.out}", flush=True)
+    dump_json(out, {"meta": dict(model_id=model_id, offset=offset, n=n,
+                                 gated_span=gated_span),
+                    "baseline_nll_mean": float(base_all.mean()), "rows": rows})
+    logger.info(f"saved {out}")
 
 
 if __name__ == "__main__":
-    main()
+    app()

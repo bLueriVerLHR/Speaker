@@ -1,0 +1,19 @@
+# MoL kmax operating-point scan (0911定标知识: kmax16首超dense).
+# Usage: python tools/sweep.py run --config configs/moe_kmax.yaml   (dry-run prints)
+#        python tools/sweep.py run --config configs/moe_kmax.yaml --no-dry-run
+command:
+  - finetune/train.py
+  - --model_id
+  - /home/hdd/model/Qwen2.5-7B-Instruct
+  - --gate_mode
+  - moe
+  - --use_lora
+  - --max_steps
+  - "4000"
+  - --anneal_steps
+  - "4000"
+  - --ul_mode
+  - rollout
+axes:
+  kmax: [12, 16, 20]
+  ul_coef: [0.3, 0.6]

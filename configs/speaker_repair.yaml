@@ -1,0 +1,18 @@
+# Speaker (threshold) repair recipe: gating-first + rollout-UL + auto ruler.
+# Same-arena counterpart to moe_kmax.yaml (r7协议同切片/LoRA, 见PLAN.md).
+command:
+  - finetune/train.py
+  - --model_id
+  - /home/hdd/model/Qwen2.5-7B-Instruct
+  - --gate_mode
+  - threshold
+  - --use_lora
+  - --max_steps
+  - "4000"
+  - --anneal_steps
+  - "4000"
+  - --ul_mode
+  - rollout
+axes:
+  ul_coef: [0.3, 0.6]
+  tau_init: [0.0, -0.5]

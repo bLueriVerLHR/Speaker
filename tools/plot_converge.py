@@ -7,17 +7,15 @@ Usage:
 JSONL row format: {"step","subset_loss","best","ema_lm","k"?"exec"?} (written by the training
 script's plateau checkpoints).
 """
-import argparse
 import json
 import os
+from typing import Annotated
 
+import typer
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--logs", action="append", default=[],
-                   help="tag=converge.jsonl path, repeatable")
-    p.add_argument("--out", default="/tmp/converge.png")
-    return p.parse_args()
+from speaker.log import logger
+
+app = typer.Typer(add_completion=False)
 
 
 def load(path):
@@ -30,11 +28,17 @@ def load(path):
     return rows
 
 
-def main():
-    args = parse_args()
-    assert args.logs, "at least one --logs tag=path is required"
+@app.command()
+def main(
+    logs: Annotated[list[str], typer.Option("--logs", help="tag=converge.jsonl path, repeatable")] = [],
+    out: Annotated[str, typer.Option("--out")] = "/tmp/converge.png",
+) -> None:
+    """Plot held-out subset loss / k-or-exec over steps from converge.jsonl files."""
+    from speaker.terminal import setup_terminal
+    setup_terminal()
+    assert logs, "at least one --logs tag=path is required"
     series = []
-    for item in args.logs:
+    for item in logs:
         tag, path = item.split("=", 1)
         assert os.path.exists(path), f"does not exist: {path}"
         series.append((tag, load(path)))
@@ -69,10 +73,10 @@ def main():
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(args.out, dpi=130)
+    fig.savefig(out, dpi=130)
     plt.close(fig)
-    print(f"saved {args.out}", flush=True)
+    logger.info(f"saved {out}")
 
 
 if __name__ == "__main__":
-    main()
+    app()

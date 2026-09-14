@@ -10,9 +10,11 @@ def per_token_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     Reflects the model's own ability: high NLL = hard.
     Causal LM: logits[t] predicts labels[t+1], must shift, last position padded with 0."""
     B, T, V = logits.shape
+    # labels follow the logits' device (sharded backbones emit logits on the last card;
+    # same-device .to is a no-op, so single-device numerics are bit-identical)
     nll = F.cross_entropy(
         logits[:, :-1].reshape(-1, V),
-        labels[:, 1:].reshape(-1),
+        labels[:, 1:].to(logits.device).reshape(-1),
         reduction="none",
         ignore_index=-100,
     )
@@ -28,7 +30,7 @@ def per_token_correct(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tenso
     scored dense at 0)."""
     B, T = logits.shape[:2]
     pred = logits[:, :-1].argmax(-1)
-    tgt = labels[:, 1:]
+    tgt = labels[:, 1:].to(pred.device)  # device-align (no-op single-device)
     out = torch.zeros(B, T, dtype=torch.bool, device=logits.device)
     out[:, :-1] = (pred == tgt) & (tgt != -100)
     return out
@@ -51,8 +53,8 @@ def distill_kl_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor,
     side."""
     T = max(float(temp), 1e-3)
     s = student_logits[:, :-1].float()
-    t = teacher_logits[:, :-1].float()
-    mask = (labels[:, 1:] != -100)
+    t = teacher_logits[:, :-1].float().to(s.device)  # device-align (no-op single-device)
+    mask = (labels[:, 1:].to(s.device) != -100)
     if not bool(mask.any()):
         return (s.sum() * 0.0)
     log_p = torch.log_softmax(s / T, dim=-1)

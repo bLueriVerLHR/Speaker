@@ -1,9 +1,6 @@
 """Offline unit tests: n-gram unlikelihood trigger/loss (repetition regularizer, r4)."""
 import math
-import pathlib
-import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from finetune.train import ngram_repeat_trigger, unlikelihood_loss  # shim guard: the historical import path keeps working
@@ -28,7 +25,6 @@ def test_trigger():
     v = torch.ones_like(ids, dtype=torch.bool)
     v[0, 6] = False
     assert ngram_repeat_trigger(ids, 3, v).sum() == 0
-    print("[PASS] trigger (recurrence/immediate loop/loop body/valid blocking)")
 
 
 def test_loss_value():
@@ -43,13 +39,12 @@ def test_loss_value():
     # empty trigger -> 0 without crashing
     z = unlikelihood_loss(logits.detach(), targets, torch.zeros_like(trg))
     assert z.item() == 0.0
-    print("[PASS] loss value (uniform-distribution analytic value / empty trigger)")
 
 
 def test_pushdown():
     """Behavioral: repeatedly descend on a p≈1 repetition token; its probability should be
     pushed down."""
-    V = 5
+
     logits = torch.nn.Parameter(torch.tensor([[[0., 8., 0., 0., 0.]]]))  # target=1, p≈0.9997
     targets = torch.tensor([[1]])
     trg = torch.tensor([[True]])
@@ -61,7 +56,6 @@ def test_pushdown():
         opt.step()
     p_after = logits.softmax(-1)[0, 0, 1].item()
     assert p_after < 0.9, p_after
-    print(f"[PASS] pushdown (p 0.9997 -> {p_after:.4f})")
 
 
 def test_rep3_rate():
@@ -70,7 +64,6 @@ def test_rep3_rate():
     assert abs(rep3_rate("aaaaaaa") - 0.8) < 1e-6
     # "abcabc": grams [abc,bca,cab,abc] -> 1 recurring of 4
     assert abs(rep3_rate("abcabc") - 0.25) < 1e-6
-    print("[PASS] rep3_rate (distinct 0 / loop 0.8 / mixed 0.25)")
 
 
 def test_gt_repeat_rate():
@@ -82,13 +75,3 @@ def test_gt_repeat_rate():
     v2 = valid.clone()
     v2[0, 5] = False
     assert gt_repeat_rate(ids, v2, 3) == 0.0
-    print("[PASS] gt_repeat_rate (density / valid blocking)")
-
-
-if __name__ == "__main__":
-    test_trigger()
-    test_loss_value()
-    test_pushdown()
-    test_rep3_rate()
-    test_gt_repeat_rate()
-    print("All UL tests passed.")

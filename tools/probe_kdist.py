@@ -13,53 +13,27 @@ Outputs JSON (+ same-named .png, needs matplotlib): per-token total-k distributi
 histogram, per-layer execution rates, five-model forward peak GPU memory, optional generation
 comparison (dense vs ours).
 """
-import argparse
-import gc
-import json
 import os
 import pathlib
 import sys
-import time
+from typing import Annotated
 
 import torch
+import typer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from data.sft import SFTDataset, make_collate
-from speaker import SpeakerConfig, convert_to_speaker
-from speaker.metrics import per_token_correct, per_token_nll
+from speaker import SpeakerConfig
+from speaker.evaluate import chunked_nll_correct
 from baselines.assemble import assemble  # noqa: E402
 from baselines.lib import collect_mdf_stats, collect_modd_stats, eval_heldout_rt
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_id", default="/home/hdd/model/Qwen2.5-7B-Instruct",
-                   help="same as the finetune-track default (7B)")
-    p.add_argument("--data_path", default="./data/sft_t2t_mini.jsonl")
-    p.add_argument("--ours", action="append", default=[],
-                   help="ours ckpt (mod_config.json+gate.pt, may carry a full base), repeatable, tag=ours:<basename>")
-    p.add_argument("--use_lora", default=True, action=argparse.BooleanOptionalAction,
-                   help="LoRA wrapping for ours ckpts (modd/mdf read use_lora from their config first)")
-    p.add_argument("--lora_rank", type=int, default=8, help="same as the train.py default")
-    p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--lora_targets", default="q_proj,v_proj")
-    p.add_argument("--modd", default="", help="MoD ckpt (modd_config.json+routers.pt)")
-    p.add_argument("--mdf", default="", help="MoDification ckpt (mdf_config.json+routers.pt)")
-    p.add_argument("--rt", default="", help="RT ckpt (rt_config.json+routers.pt)")
-    p.add_argument("--offset", type=int, default=1000)
-    p.add_argument("--n", type=int, default=100)
-    p.add_argument("--max_len", type=int, default=256)
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--device", default="cuda:0")
-    p.add_argument("--gen_tokens", type=int, default=0,
-                   help=">0 additionally runs a dense-vs-ours generation comparison (new tokens per prompt)")
-    p.add_argument("--out", default=".logs/kdist.json")
-    p.add_argument("--no_png", action="store_true")
-    return p.parse_args()
-
+from tools._common import collect_gc, dump_json
+from tools._common import module_gb as weights_gb  # noqa: E402
+from speaker.log import logger  # noqa: E402
+from speaker.terminal import setup_terminal, track
 
 def load_base(src, device):
     m = AutoModelForCausalLM.from_pretrained(
@@ -68,29 +42,39 @@ def load_base(src, device):
     return m
 
 
-def weights_gb(model):
-    return sum(p.numel() * p.element_size() for p in model.parameters()) / 1e9
-
-
-def fwd_eval(model, texts, coll, device, batch_size, k_fn=None, layer_fn=None):
+def fwd_eval(model, texts, coll, device, batch_size, k_fn=None, layer_fn=None,
+             pos_bins=0):
     model.eval()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
     sum_nll = n_tok = n_ok = 0.0
     ks, layer_sum, layer_n = [], {}, {}
+    bin_sum = [0.0] * pos_bins
+    bin_n = [0] * pos_bins
     with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
+        for i in track(range(0, len(texts), batch_size),
+                       total=(len(texts) + batch_size - 1) // batch_size,
+                       desc="fwd"):
             b = coll(texts[i:i + batch_size])
             out = model(**b)
-            logits = out.logits.float()
-            valid = b["attention_mask"].bool()
-            sum_nll += per_token_nll(logits, b["labels"])[valid].sum().item()
+            valid = b["attention_mask"].bool().to(out.logits.device)
+            nll, correct = chunked_nll_correct(out.logits, b["labels"])
+            sum_nll += nll[valid].sum().item()
             n_tok += valid.sum().item()
-            n_ok += per_token_correct(logits, b["labels"])[valid].sum().item()
+            n_ok += correct[valid].sum().item()
+            del nll, correct
             if k_fn is not None:
                 kv = k_fn(valid)
                 if kv is not None:
                     ks.extend(kv.tolist())
+                    if pos_bins:
+                        # valid.nonzero() is row-major, same order as k_fn(valid)
+                        pb = (valid.nonzero()[:, 1] * pos_bins
+                              // valid.size(1)).clamp_max(pos_bins - 1).to(kv.device)
+                        for bi in range(pos_bins):
+                            m = pb == bi
+                            bin_sum[bi] += kv[m].sum().item()
+                            bin_n[bi] += m.sum().item()
             if layer_fn is not None:
                 for idx, rate, n in layer_fn(valid):
                     layer_sum[idx] = layer_sum.get(idx, 0.0) + rate * n
@@ -112,6 +96,8 @@ def fwd_eval(model, texts, coll, device, batch_size, k_fn=None, layer_fn=None):
                           "hist_total_k_0_30": h}
     if layer_sum:
         res["layer_exec"] = {str(i): layer_sum[i] / max(layer_n[i], 1) for i in sorted(layer_sum)}
+    if pos_bins and any(bin_n):
+        res["k_by_posbin"] = [s / max(n, 1) for s, n in zip(bin_sum, bin_n)]
     return res
 
 
@@ -166,8 +152,8 @@ def plot(out_dict, png_path):
     peaks = [out_dict[nm]["peak_gb"] for nm in names]
     wts = [out_dict[nm].get("weights_gb", 0) for nm in names]
     b1 = ax.bar([short(n) for n in names], wts, color="#999999", label="weights")
-    b2 = ax.bar([short(n) for n in names], [p - wt for p, wt in zip(peaks, wts)], bottom=wts,
-                color="#d62728", label="activations+tmp")
+    ax.bar([short(n) for n in names], [p - wt for p, wt in zip(peaks, wts)], bottom=wts,
+           color="#d62728", label="activations+tmp")
     ax.set_title("forward peak GB")
     ax.legend(fontsize=8)
     ax.tick_params(axis="x", rotation=20)
@@ -180,36 +166,83 @@ def plot(out_dict, png_path):
     return png_path
 
 
-def main():
-    args = parse_args()
-    device = args.device
-    tok = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+def routed_k_from(collect_fn, routed, n_dense):
+    """Per-token total-k getter closing over one baseline's stats collector."""
+    def _k(valid):
+        _, kk = collect_fn(routed, training=False)
+        return (kk[valid] + n_dense).float() if kk is not None else None
+    return _k
+
+
+def routed_layers_from(routed, r_idx, is_routed):
+    """Per-layer exec-rate rows closing over one baseline's patched layers."""
+    def _layers(valid):
+        nv = valid.sum().item()
+        for j, p in enumerate(routed):
+            sel = getattr(p, "_last_sel", None)
+            if sel is not None:
+                yield r_idx[j] if j < len(r_idx) else j, float(sel[valid].float().mean()), nv
+        for i, r in enumerate(is_routed):
+            if not r:
+                yield i, 1.0, nv
+    return _layers
+
+
+app = typer.Typer(add_completion=False)
+
+
+@app.command()
+def main(
+    model_id: Annotated[str, typer.Option("--model_id", help="same as the finetune-track default (7B)")] = "/home/hdd/model/Qwen2.5-7B-Instruct",
+    data_path: Annotated[str, typer.Option("--data_path")] = "./data/sft_t2t_mini.jsonl",
+    ours: Annotated[list[str], typer.Option("--ours", help="ours ckpt (mod_config.json+gate.pt, may carry a full base), repeatable, tag=ours:<basename>")] = [],
+    use_lora: Annotated[bool, typer.Option("--use_lora/--no-use_lora", help="LoRA wrapping switch (must match training; families adapt per ckpt config)")] = True,
+    lora_rank: Annotated[int, typer.Option("--lora_rank", help="same as the train.py default")] = 8,
+    lora_alpha: Annotated[int, typer.Option("--lora_alpha")] = 16,
+    lora_targets: Annotated[str, typer.Option("--lora_targets")] = "q_proj,v_proj",
+    modd: Annotated[str, typer.Option("--modd", help="MoD ckpt (modd_config.json+routers.pt)")] = "",
+    mdf: Annotated[str, typer.Option("--mdf", help="MoDification ckpt (mdf_config.json+routers.pt)")] = "",
+    rt: Annotated[str, typer.Option("--rt", help="RT ckpt (rt_config.json+routers.pt)")] = "",
+    offset: Annotated[int, typer.Option("--offset")] = 1000,
+    n: Annotated[int, typer.Option("--n")] = 100,
+    max_len: Annotated[int, typer.Option("--max_len")] = 256,
+    batch_size: Annotated[int, typer.Option("--batch_size")] = 4,
+    pos_bins: Annotated[int, typer.Option("--pos_bins", help="split the window into N position bins and report mean-k per bin (0=off)")] = 0,
+    device: Annotated[str, typer.Option("--device")] = "cuda:0",
+    out: Annotated[str, typer.Option("--out")] = ".logs/kdist.json",
+    no_png: Annotated[bool, typer.Option("--no_png")] = False,
+) -> None:
+    """Five-way k distribution / per-layer execution rate / peak-memory probe."""
+    setup_terminal()
+    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    full = SFTDataset(args.data_path, args.offset + args.n, tok=None, use_chat=False)
-    texts = full.samples[args.offset:args.offset + args.n]
+    full = SFTDataset(data_path, offset + n, tok=None, use_chat=False)
+    texts = full.samples[offset:offset + n]
     assert texts, "the eval slice is empty"
-    coll = make_collate(tok, device, args.max_len, False, True)
-    out = {"meta": vars(args)}
+    coll = make_collate(tok, device, max_len, False, True)
+    res = {"meta": dict(model_id=model_id, data_path=data_path, offset=offset,
+                        n=n, max_len=max_len, batch_size=batch_size)}
+    lora = (dict(rank=lora_rank, alpha=lora_alpha, targets=lora_targets)
+            if use_lora else None)
 
-    m = load_base(args.model_id, device).to(device)
-    out["dense"] = {"weights_gb": weights_gb(m)}
-    out["dense"].update(fwd_eval(m, texts, coll, device, args.batch_size))
-    print(f"[dense] loss {out['dense']['loss']:.3f} acc {out['dense']['acc']:.3f} "
-          f"peak {out['dense']['peak_gb']:.2f}GB", flush=True)
+    m = load_base(model_id, device).to(device)
+    res["dense"] = {"weights_gb": weights_gb(m)}
+    res["dense"].update(fwd_eval(m, texts, coll, device, batch_size))
+    logger.info(f"[dense] loss {res['dense']['loss']:.3f} acc {res['dense']['acc']:.3f} "
+                f"peak {res['dense']['peak_gb']:.2f}GB")
     del m
-    gc.collect()  # 7B: patch/peft reference cycles need gc, otherwise the next model load OOMs
-    torch.cuda.empty_cache()
+    collect_gc()  # 7B: patch/peft reference cycles need gc, otherwise the next model load OOMs
 
-    for ckpt in args.ours:
+    for ckpt in ours:
         tag = f"ours:{os.path.basename(ckpt.rstrip('/'))}"
-        asm = assemble(ckpt, args.model_id, args, device, skip_mode=None)
+        asm = assemble(ckpt, model_id, lora, device, skip_mode=None)
         w = asm.model
         m = w
         oc = SpeakerConfig.from_json(os.path.join(ckpt, "mod_config.json"))
         n_always = len(oc.always_on_layers)
         gp = sum(p.numel() for p in w.get_router_parameters())
-        out[tag] = {"weights_gb": weights_gb(m), "gate_params": gp,
+        res[tag] = {"weights_gb": weights_gb(m), "gate_params": gp,
                     "gate_share": gp / sum(p.numel() for p in m.parameters())}
 
         def ours_k(valid, _w=w):
@@ -227,156 +260,72 @@ def main():
                         hm = o.hard_mask.squeeze(-1)[valid].float()
                         yield lyr.layer_idx, hm.mean().item(), nv
 
-        out[tag].update(fwd_eval(w, texts, coll, device, args.batch_size, ours_k, ours_layers))
-        k = out[tag]["k_total"]
-        print(f"[{tag}] k_total {k['mean']:.1f}±{k['std']:.1f} "
-              f"q={['%.1f' % v for v in k['q01_10_25_50_75_90_100']]}", flush=True)
+        res[tag].update(fwd_eval(w, texts, coll, device, batch_size, ours_k, ours_layers,
+                                 pos_bins=pos_bins))
+        k = res[tag]["k_total"]
+        logger.info(f"[{tag}] k_total {k['mean']:.1f}±{k['std']:.1f} "
+                    f"q={['%.1f' % v for v in k['q01_10_25_50_75_90_100']]}")
         del ours_k, ours_layers, w, m  # the closure holds w via the _w default arg; without del, the next round's to(device) OOMs
-        gc.collect()
-        torch.cuda.empty_cache()
+        collect_gc()
 
-    if args.modd:
-        asm = assemble(args.modd, args.model_id, args, device)
+    if modd:
+        asm = assemble(modd, model_id, lora, device)
         m, routed, mc = asm.model, asm.routed, asm.cfg
         n_dense = asm.n_dense
         r_idx = [i for i, r in enumerate(mc["is_routed"]) if r]
-        out["modd"] = {"weights_gb": weights_gb(m)}
+        res["modd"] = {"weights_gb": weights_gb(m)}
 
-        def modd_k(valid):
-            _, kk = collect_modd_stats(routed, training=False)
-            return (kk[valid] + n_dense).float() if kk is not None else None
+        modd_k = routed_k_from(collect_modd_stats, routed, n_dense)
+        modd_layers = routed_layers_from(routed, r_idx, mc["is_routed"])
 
-        def modd_layers(valid):
-            nv = valid.sum().item()
-            for j, p in enumerate(routed):
-                sel = getattr(p, "_last_sel", None)
-                if sel is not None:
-                    yield r_idx[j] if j < len(r_idx) else j, float(sel[valid].float().mean()), nv
-            for i, r in enumerate(mc["is_routed"]):
-                if not r:
-                    yield i, 1.0, nv
-
-        out["modd"].update(fwd_eval(m, texts, coll, device, args.batch_size, modd_k, modd_layers))
-        k = out["modd"]["k_total"]
-        print(f"[modd] k_total {k['mean']:.1f}±{k['std']:.1f}", flush=True)
+        res["modd"].update(fwd_eval(m, texts, coll, device, batch_size, modd_k, modd_layers,
+                                    pos_bins=pos_bins))
+        k = res["modd"]["k_total"]
+        logger.info(f"[modd] k_total {k['mean']:.1f}±{k['std']:.1f}")
         del modd_k, modd_layers, routed, m  # the closure holds the model via routed; without del, the next round OOMs
-        gc.collect()
-        torch.cuda.empty_cache()
+        collect_gc()
 
-    if args.mdf:
-        asm = assemble(args.mdf, args.model_id, args, device)
+    if mdf:
+        asm = assemble(mdf, model_id, lora, device)
         m, routed, mc = asm.model, asm.routed, asm.cfg
         n_dense = asm.n_dense
         r_idx = [i for i, r in enumerate(mc["is_routed"]) if r]
-        out["mdf"] = {"weights_gb": weights_gb(m)}
+        res["mdf"] = {"weights_gb": weights_gb(m)}
 
-        def mdf_k(valid):
-            _, kk = collect_mdf_stats(routed, training=False)
-            return (kk[valid] + n_dense).float() if kk is not None else None
+        mdf_k = routed_k_from(collect_mdf_stats, routed, n_dense)
+        mdf_layers = routed_layers_from(routed, r_idx, mc["is_routed"])
 
-        def mdf_layers(valid):
-            nv = valid.sum().item()
-            for j, p in enumerate(routed):
-                sel = getattr(p, "_last_sel", None)
-                if sel is not None:
-                    yield r_idx[j] if j < len(r_idx) else j, float(sel[valid].float().mean()), nv
-            for i, r in enumerate(mc["is_routed"]):
-                if not r:
-                    yield i, 1.0, nv
-
-        out["mdf"].update(fwd_eval(m, texts, coll, device, args.batch_size, mdf_k, mdf_layers))
-        k = out["mdf"]["k_total"]
-        print(f"[mdf] k_total {k['mean']:.1f}±{k['std']:.1f}", flush=True)
+        res["mdf"].update(fwd_eval(m, texts, coll, device, batch_size, mdf_k, mdf_layers,
+                                   pos_bins=pos_bins))
+        k = res["mdf"]["k_total"]
+        logger.info(f"[mdf] k_total {k['mean']:.1f}±{k['std']:.1f}")
         del mdf_k, mdf_layers, routed, m
-        gc.collect()
-        torch.cuda.empty_cache()
+        collect_gc()
 
-    if args.rt:
-        asm = assemble(args.rt, args.model_id, args, device)
+    if rt:
+        asm = assemble(rt, model_id, lora, device)
         m, gated = asm.model, asm.gated
-        rc = asm.cfg
-        r = eval_heldout_rt(m, gated, texts, coll, args.batch_size, n_always=asm.n_always)
+
+        r = eval_heldout_rt(m, gated, texts, coll, batch_size, n_always=asm.n_always)
         torch.cuda.reset_peak_memory_stats(device)
         with torch.no_grad():
-            for i in range(0, len(texts), args.batch_size):
-                m(**coll(texts[i:i + args.batch_size]))
-        out["rt"] = {"loss": r["loss"], "acc": r["acc"], "exec_rate": r["exec_rate"],
+            for i in range(0, len(texts), batch_size):
+                m(**coll(texts[i:i + batch_size]))
+        res["rt"] = {"loss": r["loss"], "acc": r["acc"], "exec_rate": r["exec_rate"],
                      "weights_gb": weights_gb(m),
                      "peak_gb": torch.cuda.max_memory_allocated(device) / 1e9}
-        print(f"[rt] exec {r['exec_rate']:.2f}", flush=True)
+        logger.info(f"[rt] exec {r['exec_rate']:.2f}")
         del gated, m
-        gc.collect()
-        torch.cuda.empty_cache()
+        collect_gc()
 
-    if args.gen_tokens > 0 and args.ours:
-        prompts = ["The future development trends of artificial intelligence are",
-                   "Explain what photosynthesis is:",
-                   "Write a short poem about spring:", "The summation process of 1+2+...+100 is",
-                   "What are Lu Xun's representative works? Please list them"]
-        gen = {}
-        for name, src, wrap in (("dense", args.model_id, False), ("ours", args.ours, True)):
-            m = load_base(src, device)
-            if wrap:
-                oc = SpeakerConfig.from_json(os.path.join(args.ours, "mod_config.json"))
-                w = convert_to_speaker(m, oc)
-                w.load_state_dict(torch.load(os.path.join(args.ours, "gate.pt"),
-                                             map_location="cpu"), strict=False)
-                for mode in ("soft", "hard"):
-                    w.set_skip_mode(mode)
-                    w.get_skip_hits(reset=True)
-                    mm = w.to(device).eval()
-                    torch.cuda.reset_peak_memory_stats(device)
-                    t0 = time.time()
-                    n_new, outs = 0, []
-                    with torch.no_grad():
-                        for p in prompts:
-                            ids = tok(p, return_tensors="pt").input_ids.to(device)
-                            o = mm.generate(ids, max_new_tokens=args.gen_tokens, do_sample=False,
-                                            use_cache=True, pad_token_id=tok.eos_token_id)
-                            n_new += o.shape[1] - ids.shape[1]
-                            outs.append(tok.decode(o[0, ids.shape[1]:]))
-                    dt = time.time() - t0
-                    gen[f"ours-{mode}"] = {"sec": dt, "tok_per_s": n_new / max(dt, 1e-6),
-                                           "peak_gb": torch.cuda.max_memory_allocated(device) / 1e9,
-                                           "skip_hits": mm.get_skip_hits(),
-                                           "samples": [s[:150] for s in outs]}
-                    print(f"[ours-{mode}] {gen[f'ours-{mode}']['tok_per_s']:.1f} tok/s "
-                          f"peak {gen[f'ours-{mode}']['peak_gb']:.3f}GB "
-                          f"skips {gen[f'ours-{mode}']['skip_hits']}", flush=True)
-                del w, m
-                gc.collect()
-            else:
-                m = m.to(device).eval()
-                torch.cuda.reset_peak_memory_stats(device)
-                t0 = time.time()
-                n_new, outs = 0, []
-                with torch.no_grad():
-                    for p in prompts:
-                        ids = tok(p, return_tensors="pt").input_ids.to(device)
-                        o = m.generate(ids, max_new_tokens=args.gen_tokens, do_sample=False,
-                                       use_cache=True, pad_token_id=tok.eos_token_id)
-                        n_new += o.shape[1] - ids.shape[1]
-                        outs.append(tok.decode(o[0, ids.shape[1]:]))
-                dt = time.time() - t0
-                gen["dense"] = {"sec": dt, "tok_per_s": n_new / max(dt, 1e-6),
-                                "peak_gb": torch.cuda.max_memory_allocated(device) / 1e9,
-                                "samples": [s[:150] for s in outs]}
-                print(f"[dense] {gen['dense']['tok_per_s']:.1f} tok/s "
-                      f"peak {gen['dense']['peak_gb']:.3f}GB", flush=True)
-                del m
-                gc.collect()
-            torch.cuda.empty_cache()
-        out["generate"] = gen
-
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=1, ensure_ascii=False)
-    print(f"saved {args.out}", flush=True)
+    dump_json(out, res)
+    logger.info(f"saved {out}")
     try:
-        png = None if args.no_png else plot(out, os.path.splitext(args.out)[0] + ".png")
-        print(f"saved {png}", flush=True)
+        png = None if no_png else plot(res, os.path.splitext(out)[0] + ".png")
+        logger.info(f"saved {png}")
     except ImportError:
-        print("matplotlib unavailable, skipping plot", flush=True)
+        logger.warning("matplotlib unavailable, skipping plot")
 
 
 if __name__ == "__main__":
-    main()
+    app()

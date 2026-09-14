@@ -66,13 +66,12 @@ Training turns two knobs on this picture:
       loss  = LM + λ·mean(k) + β·KL(sparse ‖ frozen dense)  (+ aux regularizers)
       dual  :  ema_acc < acc_target  ⇒  λ relaxes (buys layers back)
                ema_acc ≥ acc_target  ⇒  λ tightens (pushes sparsity)
-      acc_target defaults to auto: measured dense acc − margin, so the floor
-      follows the base model instead of a hand-set constant (details: docs/training.md)
+      acc_target defaults to none (fixed λ); auto re-anchors the floor to
+      measured dense acc − margin instead of a hand-set constant (details: docs/training.md)
 ```
 
-Gating exists in two modes behind one switch (`gate_mode`): **moe** (default mainline,
-the joint router above) and **threshold** (legacy per-layer gate, kept for old
-checkpoints) — details in [docs/gating.md](docs/gating.md).
+Gating exists in two modes behind one switch (`gate_mode`): **threshold** (default,
+per-layer gate) and **moe** (joint router above) — details in [docs/gating.md](docs/gating.md).
 
 ## 2. Positioning vs the MoD lineage
 
@@ -97,8 +96,16 @@ Speaker/
   speaker/            # core library: fixed+gated layer model (shared by both tracks)
     config.py         #   SpeakerConfig: fixed set / gate_mode / budget & dual hyperparams
     gating.py         #   JointRouter (moe) + Router (threshold) + GatingOutput
-    wrapper.py        #   SpeakerLayerWrapper (gated residual + sparse KV + cross-device)
-                      #   + SpeakerModelWrapper + convert_to_speaker
+    layer.py          #   SpeakerLayerWrapper (gated residual + sparse KV + cross-device)
+    hub.py            #   SpeakerModelWrapper (routing hub / stats / budget) + convert_to_speaker
+    placement.py      #   hierarchical placement primitives (delegated from the hub)
+    calibrate.py      #   init-time tau / router-temp calibration (delegated from the hub)
+    wrapper.py        #   facade re-exporting layer.py + hub.py (old imports keep working)
+    strategies.py     #   gating-strategy seam: ThresholdStrategy / MoeStrategy registry
+    hparams.py        #   FinetuneConfig dataclass (typed training knobs, no argparse)
+    terminal.py       #   rich console / tracebacks / tty-aware progress
+    config_model.py   #   optional pydantic-v2 validation mirror of SpeakerConfig
+    accelerate_backend.py  # opt-in Accelerate/Fabric wrapper (default none = legacy)
     scheduler.py      #   GPU-residency scheduling: random/lru/lfu over a weights budget
     load_profile.py   #   layer-load profiling: load -> fixed-layer promotion / GPU-CPU plan
     metrics.py        #   per-token NLL/acc / activation-memory estimate / KL distillation
@@ -106,17 +113,21 @@ Speaker/
     ruler.py          #   accuracy scale: valid masks + acc_target policy (auto = dense − margin)
     dual.py           #   DualController: accuracy EMA + warmup gate + λ adaptation
     ul.py             #   anti-repetition: n-gram unlikelihood terms + rep3 probes
-    checkpoint.py     #   ckpt I/O: gate-key filtering / prefix stripping / clean base
+    checkpoint.py     #   ckpt I/O: gate-key filtering / prefix stripping / clean base (+safetensors)
     train_common.py   #   shared training boilerplate (device/tokenizer/model/LoRA/groups)
-    log.py            #   RunLogger: metrics.jsonl + layers.jsonl + one-line stdout
+    log.py            #   primary logger (loguru): console + run.log + JSONL sinks, no tee
   docs/               # per-mechanism documentation: gating / training / inference / related work
-  data/               # data pipeline (shared): SFTDataset / chat template / collate
+  data/               # data pipeline (shared): SFTDataset (+streaming) / chat template / collate
+  configs/            # sweep YAMLs (cartesian multirun specs for tools/sweep.py)
   pretrain/           # from-scratch training (design-first)
-  finetune/           # finetune track: gating-first train / profile+promote / resume / eval
+  finetune/           # finetune track: cli.py (Typer) / pipeline.py (loop) / train.py (entry)
+                      #   + profile+promote / resume / eval
   baselines/          # MoD + MoDification + Router-Tuning + dense-ft + same-slice comparison
                       #   train_loop.py: one shared loop (BaselineRecipe per family)
-  tests/              # offline unit suites + on-device smokes (incl. ruler/dual + UL)
-  tools/              # experiment tooling: eval_gen / probe_layers / probe_kdist / plotting
+                      #   assemble.py: ModelBuilder with decorator family registry
+  tests/              # offline unit suites + on-device smokes (incl. ruler/dual + UL +
+                      #   registry + tooling seams)
+  tools/              # experiment tooling: eval_gen / probe_kdist / sweep / plotting + ci.sh
 ```
 
 Legacy aliases: `from speaker import MoDConfig, convert_to_mod, ...` still work; old

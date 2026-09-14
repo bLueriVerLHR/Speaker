@@ -1,40 +1,10 @@
 """MoDification baseline (threshold-p + R objective) offline self-tests: threshold semantics /
 shared-gate math / R gradients / k statistics."""
-import pathlib
-import sys
-
 import torch
-import torch.nn as nn
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from baselines.lib import _select_threshold, collect_mdf_stats, patch_model_mdf
 
 
-class FakeDecoderLayer(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.self_attn = nn.Identity()
-        self.mlp = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.SiLU(),
-                                 nn.Linear(hidden_size, hidden_size))
-
-    def forward(self, hidden_states, attention_mask=None, **kwargs):
-        return (hidden_states + self.mlp(hidden_states) * 0.1,)
-
-
-class FakeHF(nn.Module):
-    def __init__(self, n=6, h=32):
-        super().__init__()
-        self.config = type("Cfg", (), {"num_hidden_layers": n, "hidden_size": h})()
-        self.model = type("M", (), {})()
-        self.model.layers = nn.ModuleList([FakeDecoderLayer(h) for _ in range(n)])
-        self.lm_head = nn.Linear(h, 100)
-
-    def forward(self, hidden_states=None, input_ids=None, attention_mask=None, **kwargs):
-        if hidden_states is None:
-            hidden_states = torch.randn(2, 8, 32)
-        for layer in self.model.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask, **kwargs)[0]
-        return {"logits": self.lm_head(hidden_states)}
+from tests._fakes import FakeHF
 
 
 def test_select_threshold():
@@ -55,7 +25,6 @@ def test_select_threshold():
     assert ((sel4 == (g >= 0.5))).all()
     # arbitrary count (not a fixed k): the essential difference from top-k
     assert sel[0].sum() != sel[1].sum() or True  # the count is determined by the score distribution, not asserted in the smoke check
-    print("[PASS] select_threshold (threshold/padding/boundary)")
 
 
 def test_shared_gate_math():
@@ -76,7 +45,6 @@ def test_shared_gate_math():
         routed[0].route_p = 1.0
         out2 = routed[0](x, attention_mask=am)
         assert torch.allclose(out2[0], x, atol=1e-5), "with everything skipped the layer should be identity"
-    print("[PASS] shared gate math")
 
 
 def test_R_loss_and_stats():
@@ -109,11 +77,3 @@ def test_R_loss_and_stats():
         o1 = fake(hidden_states=x, attention_mask=am)["logits"]
         o2 = fake(hidden_states=x, attention_mask=am)["logits"]
         assert torch.allclose(o1, o2), "threshold-p should be deterministic (no randomness)"
-    print("[PASS] R loss + k stats + determinism")
-
-
-if __name__ == "__main__":
-    test_select_threshold()
-    test_shared_gate_math()
-    test_R_loss_and_stats()
-    print("\nAll MoDification baseline tests passed.")

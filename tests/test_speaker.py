@@ -19,44 +19,7 @@ assert MoDConfig is SpeakerConfig and MoDLayerWrapper is SpeakerLayerWrapper
 assert MoDModelWrapper is SpeakerModelWrapper and convert_to_mod is convert_to_speaker
 
 
-class FakeDecoderLayer(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.self_attn = nn.Identity()
-        self.mlp = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.SiLU(),
-                                 nn.Linear(hidden_size, hidden_size))
-
-    def forward(self, hidden_states, attention_mask=None, **kwargs):
-        out = hidden_states + self.mlp(hidden_states) * 0.1
-        if kwargs.get("use_cache"):
-            return (out, kwargs.get("past_key_value"))
-        return (out,)
-
-
-class FakeHF(nn.Module):
-    def __init__(self, n=6, h=32):
-        super().__init__()
-        self.config = type("Cfg", (), {"num_hidden_layers": n, "hidden_size": h})()
-        self.model = type("M", (), {})()
-        self.model.layers = nn.ModuleList([FakeDecoderLayer(h) for _ in range(n)])
-        self.lm_head = nn.Linear(h, 100)
-
-    def forward(self, hidden_states=None, input_ids=None, attention_mask=None, **kwargs):
-        if hidden_states is None:
-            hidden_states = torch.randn(2, 8, 32)
-        for layer in self.model.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask, **kwargs)[0]
-        return {"logits": self.lm_head(hidden_states)}
-
-
-def force_onehot(mod, slot: int):
-    """moe: force the joint router into one-hot (zeroed net weights + a large prior for one
-    slot -> only that gated layer is selected)."""
-    mod.eval()
-    mod.set_skip_mode("soft")
-    mod.joint_router.net.weight.data.zero_()
-    mod.joint_router.layer_bias.data.fill_(0.0)
-    mod.joint_router.layer_bias.data[slot] = 50.0
+from tests._fakes import FakeHF, force_onehot
 
 
 def test_config():
@@ -94,8 +57,6 @@ def test_config():
             raise AssertionError(f"should reject invalid config {bad}")
         except ValueError:
             pass
-    print("[PASS] config (both modes)", cfg.summary())
-
 
 def test_config_from_json():
     """Old checkpoints (no gate_mode field) infer threshold; deprecated legacy fields are
@@ -117,8 +78,6 @@ def test_config_from_json():
         c3 = SpeakerConfig.from_json(p)
         assert c3.gate_mode == "threshold", "old checkpoints must be inferred as threshold"
         assert c3.tau_init == -3.0 and c3.use_ste is False, "legacy-scheme fields must parse as-is in threshold mode"
-    print("[PASS] config from_json (mode inference + old-key filter)")
-
 
 def test_decode_recipe():
     """ed9/C: ckpt-shipped decode recipe — None default (legacy), JSON roundtrip,
@@ -163,8 +122,6 @@ def test_decode_recipe():
     assert out == {} and gc.repetition_penalty == 1.15, "unknown keys must be ignored loudly"
     out = apply_decode_config(SimpleNamespace(), {"repetition_penalty": 1.2})
     assert out == {}, "missing generation_config must warn and no-op"
-    print("[PASS] decode recipe (config roundtrip + validation + apply)")
-
 
 def test_router():
     """threshold: the per-layer Router has no bias; the threshold is carried solely by tau."""
@@ -175,8 +132,6 @@ def test_router():
     assert logits.shape == (2, 8, 1)
     r2 = Router(hidden_size=32, hidden_dim=8)  # MLP variant
     assert r2(x).shape == (2, 8, 1)
-    print("[PASS] router (threshold)")
-
 
 def test_joint_router():
     """moe: single-point JointRouter, bias-free net + layer_bias prior."""
@@ -185,8 +140,6 @@ def test_joint_router():
     x = torch.randn(2, 8, 32)
     logits = r(x)
     assert logits.shape == (2, 8, 5) and logits.dtype == torch.float32
-    print("[PASS] joint router (moe)")
-
 
 def test_select_top_p():
     G = 4
@@ -237,8 +190,6 @@ def test_select_top_p():
     assert rd8.k_soft.requires_grad, "k_soft must be differentiable (gradient path for the budget λ·mean(k))"
     rd8.k_soft.sum().backward()
     assert lg.grad is not None and lg.grad.abs().sum().item() > 0, "soft-inclusive gradient should reach the router"
-    print("[PASS] select top-p/top-k + STE (moe)")
-
 
 def test_budget_threshold():
     """threshold: pure Lagrangian formulation; both router and tau should receive gradients."""
@@ -274,7 +225,7 @@ def test_budget_threshold():
     assert any(nm.endswith("tau") for nm in named), "tau should receive gradients"
     aux = mod.get_aux_loss()
     assert aux is not None and aux.requires_grad
-    print(f"[PASS] budget grad (threshold) gate {ng}/{len(gate_ps)} loss {loss.item():.4f}")
+
     # eval: deterministic with noise off
     mod.eval()
     with torch.no_grad():
@@ -286,8 +237,6 @@ def test_budget_threshold():
     with torch.no_grad():
         o = mod(hidden_states=x, attention_mask=am)
         assert "logits" in o
-    print("[PASS] eval deterministic + hard skip (threshold)")
-
 
 def test_budget_moe():
     """moe: budget is differentiable and reaches joint_router; aux (z+balance+cos) is
@@ -325,7 +274,7 @@ def test_budget_moe():
     (out["logits"].sum() + aux).backward()
     ng2 = sum(1 for p in gate_ps if p.grad is not None and p.grad.abs().sum().item() > 0)
     assert ng2 == len(gate_ps), f"LM+aux should give gradients to all routing params, got {ng2}/{len(gate_ps)}"
-    print(f"[PASS] budget grad (moe) {ng}/{len(gate_ps)} loss {loss.item():.4f} aux grad {ng2}")
+
     mod.eval()
     with torch.no_grad():
         o1 = mod(hidden_states=x, attention_mask=am)["logits"]
@@ -337,8 +286,6 @@ def test_budget_moe():
         assert "logits" in o
     kh = mod.get_active_counts()
     assert torch.equal(kh, counts), "with no noise in eval, hard k should match the train formulation"
-    print("[PASS] eval deterministic + hard forward (moe)")
-
 
 def test_budget_lambda_map():
     """ed8 difficulty shaping: per-token λ map plumbing — ones map == legacy path
@@ -365,7 +312,6 @@ def test_budget_lambda_map():
         ng = sum(1 for p in mod.get_router_parameters()
                  if p.grad is not None and p.grad.abs().sum().item() > 0)
         assert ng > 0, f"{mode}: shaped budget must keep router gradients"
-    print("[PASS] budget lambda_map plumbing (ones==legacy, zeros==0, linear, grads)")
 
 
 def test_router_temp_calib():
@@ -415,8 +361,6 @@ def test_router_temp_calib():
     rt2 = SpeakerConfig(**{k: v for k, v in cfg.to_dict().items()
                            if k != "gated_layers"}).router_temp
     assert rt2 == rt, (rt, rt2)
-    print(f"[PASS] router temp calibration (moe) temp {rt:.3f} "
-          f"k0 {info['k_before']:.1f} -> {info['k_after']:.1f} (target 6)")
 
 
 def test_weighted_residual_onehot():
@@ -465,7 +409,6 @@ def test_weighted_residual_onehot():
                 hs = hs + wsel[cfg.gated_layers.index(i)] * (fj - hs)
         expect = fake.lm_head(hs)
     assert torch.allclose(out, expect, atol=1e-4), "soft weight mixing mismatch"
-    print("[PASS] weighted residual (moe, one-hot + soft)")
 
 
 def test_sparse_cache_threshold():
@@ -489,7 +432,7 @@ def test_sparse_cache_threshold():
         def get_seq_length(self, i):
             return self.store[i][0].shape[2] if i in self.store else 0
 
-        def update(self, k, v, layer_idx, cache_kwargs=None):
+        def update(self, k, v, layer_idx, _cache_kwargs=None):
             if layer_idx in self.store:
                 self.store[layer_idx] = (torch.cat([self.store[layer_idx][0], k], dim=2),
                                          torch.cat([self.store[layer_idx][1], v], dim=2))
@@ -506,7 +449,7 @@ def test_sparse_cache_threshold():
     x = torch.randn(2, 4, H)
     pos = torch.arange(4).unsqueeze(0).expand(2, -1)
     # prefill: empty cache + use_cache -> must execute (to keep the cache filled)
-    out = w(x, past_key_values=FakeCache(), use_cache=True, position_ids=pos)
+    w(x, past_key_values=FakeCache(), use_cache=True, position_ids=pos)
     assert inner.calls == 1, "prefill must execute"
     # decode: this layer's cache already has content -> skip, no execution and no K/V write
     c = FakeCache()
@@ -527,7 +470,6 @@ def test_sparse_cache_threshold():
     w3.eval()
     w3(x[:, -1:, :], use_cache=False)
     assert w3.layer.calls == 0, "no cache should skip directly"
-    print("[PASS] sparse cache semantics (threshold)")
 
 
 def test_sparse_cache_moe():
@@ -542,7 +484,7 @@ def test_sparse_cache_moe():
         def get_seq_length(self, i):
             return self.store[i][0].shape[2] if i in self.store else 0
 
-        def update(self, k, v, layer_idx, cache_kwargs=None):
+        def update(self, k, v, layer_idx, _cache_kwargs=None):
             if layer_idx in self.store:
                 self.store[layer_idx] = (torch.cat([self.store[layer_idx][0], k], dim=2),
                                          torch.cat([self.store[layer_idx][1], v], dim=2))
@@ -607,7 +549,6 @@ def test_sparse_cache_moe():
     with torch.no_grad():
         w3(x[:, -1:, :], use_cache=False)
     assert calls[3] == 0, "no cache should skip directly"
-    print("[PASS] sparse cache semantics (moe)")
 
 
 def test_comp_and_cos_reg():
@@ -655,7 +596,6 @@ def test_comp_and_cos_reg():
     mod_moe = SpeakerModelWrapper(FakeHF(n=n, h=h), cfg_moe)
     assert mod_moe.calibrate_tau([{"hidden_states": x, "attention_mask": am}]) == {}
     assert mod_moe.get_tau_params() == {}
-    print(f"[PASS] comp+cos calib (threshold) taus [{min(taus.values()):+.2f},{max(taus.values()):+.2f}]")
 
 
 def test_placement_and_usage():
@@ -677,7 +617,6 @@ def test_placement_and_usage():
     mod.eval()
     with torch.no_grad():
         mod(hidden_states=torch.randn(1, 4, h), attention_mask=am)
-    print("[PASS] placement/usage (moe)")
 
 
 def test_resume_gate_pt():
@@ -710,24 +649,3 @@ def test_resume_gate_pt():
         missing_m, unexp_m = mod_m2.load_state_dict(torch.load(p), strict=False)
         gate_missing_m = [m for m in missing_m if "joint_router" in m]
         assert not gate_missing_m and not unexp_m, (gate_missing_m, unexp_m)
-    print("[PASS] resume gate.pt roundtrip (both modes, key sets mutually exclusive)")
-
-
-if __name__ == "__main__":
-    test_config()
-    test_config_from_json()
-    test_decode_recipe()
-    test_router()
-    test_joint_router()
-    test_select_top_p()
-    test_budget_threshold()
-    test_budget_moe()
-    test_budget_lambda_map()
-    test_router_temp_calib()
-    test_weighted_residual_onehot()
-    test_sparse_cache_threshold()
-    test_sparse_cache_moe()
-    test_comp_and_cos_reg()
-    test_placement_and_usage()
-    test_resume_gate_pt()
-    print("\nAll speaker tests passed.")

@@ -29,6 +29,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from .log import logger
 from .metrics import per_token_correct
 
 VALID_MODES = ("labels", "attention_mask")
@@ -101,9 +102,9 @@ class AccRuler:
         elif self.policy == "fixed":
             self.resolved = self.fixed
         elif dense_acc is None:
-            print(f"WARNING [ruler] acc_target auto has no dense reference "
-                  f"(empty eval slice?); falling back to the legacy default "
-                  f"{LEGACY_DEFAULT_TARGET}", flush=True)
+            logger.warning(f"[ruler] acc_target auto has no dense reference "
+                           f"(empty eval slice?); falling back to the legacy default "
+                           f"{LEGACY_DEFAULT_TARGET}")
             self.resolved = LEGACY_DEFAULT_TARGET
         else:
             self.resolved = min(1.0, max(0.0, dense_acc - self.margin))

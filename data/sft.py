@@ -11,9 +11,25 @@ import json
 import weakref
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
+
+from speaker.log import logger
 
 CHAT_ROLES = ("system", "user", "assistant")
+
+
+def _text_of(obj: dict, tok=None, use_chat: bool = False) -> str:
+    """One jsonl record -> training text (shared by SFTDataset / SFTStreamDataset;
+    filtering ``len >= 10`` is applied by the caller, identical to history)."""
+    if use_chat:
+        text = format_sft_text(obj, tok)
+    elif "conversations" in obj:
+        text = "\n".join(f"{t['role']}: {t['content']}" for t in obj["conversations"])
+    elif "text" in obj:
+        text = obj["text"]
+    else:
+        text = str(obj)
+    return text
 
 
 def format_sft_text(obj, tok=None):
@@ -121,23 +137,50 @@ class SFTDataset(Dataset):
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if use_chat:
-                    text = format_sft_text(obj, tok)
-                elif "conversations" in obj:
-                    text = "\n".join(f"{t['role']}: {t['content']}" for t in obj["conversations"])
-                elif "text" in obj:
-                    text = obj["text"]
-                else:
-                    text = str(obj)
+                text = _text_of(obj, tok, use_chat)
                 if len(text) >= 10:
                     self.samples.append(text)
-        print(f"Loaded {len(self.samples)} samples")
+        logger.info(f"Loaded {len(self.samples)} samples")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         return self.samples[idx]
+
+
+def iter_sft_texts(path, max_samples=0, tok=None, use_chat=False):
+    """Streaming generator: same parsing/filtering as SFTDataset, no full load.
+    For full-data training (904k samples) where holding all texts is wasteful."""
+    n = 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if max_samples and n >= max_samples:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = _text_of(obj, tok, use_chat)
+            if len(text) >= 10:
+                n += 1
+                yield text
+
+
+class SFTStreamDataset(IterableDataset):
+    """Iterable SFT dataset over iter_sft_texts (full-epoch streaming)."""
+
+    def __init__(self, path, max_samples=0, tok=None, use_chat=False):
+        self.path = path
+        self.max_samples = max_samples
+        self.tok = tok
+        self.use_chat = use_chat
+
+    def __iter__(self):
+        return iter_sft_texts(self.path, self.max_samples, self.tok, self.use_chat)
 
 
 def collate(batch, tok, device, max_len):

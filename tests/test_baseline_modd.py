@@ -1,40 +1,10 @@
 """MoD original baseline (token-choice top-k) offline self-tests: capacity semantics /
 weighted residual math / BCE gradients / k statistics."""
-import pathlib
-import sys
-
 import torch
-import torch.nn as nn
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from baselines.lib import _select_topk, collect_modd_stats, patch_model_modd
 
 
-class FakeDecoderLayer(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.self_attn = nn.Identity()
-        self.mlp = nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.SiLU(),
-                                 nn.Linear(hidden_size, hidden_size))
-
-    def forward(self, hidden_states, attention_mask=None, **kwargs):
-        return (hidden_states + self.mlp(hidden_states) * 0.1,)
-
-
-class FakeHF(nn.Module):
-    def __init__(self, n=6, h=32):
-        super().__init__()
-        self.config = type("Cfg", (), {"num_hidden_layers": n, "hidden_size": h})()
-        self.model = type("M", (), {})()
-        self.model.layers = nn.ModuleList([FakeDecoderLayer(h) for _ in range(n)])
-        self.lm_head = nn.Linear(h, 100)
-
-    def forward(self, hidden_states=None, input_ids=None, attention_mask=None, **kwargs):
-        if hidden_states is None:
-            hidden_states = torch.randn(2, 8, 32)
-        for layer in self.model.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask, **kwargs)[0]
-        return {"logits": self.lm_head(hidden_states)}
+from tests._fakes import FakeHF
 
 
 def test_select_topk():
@@ -63,7 +33,6 @@ def test_select_topk():
     # no attention_mask: computed over the full length
     sel4 = _select_topk(r, None, capacity=0.25)
     assert sel4[0].sum() == 2
-    print("[PASS] select_topk (capacity/padding/ties)")
 
 
 def test_weighted_residual_math():
@@ -83,7 +52,6 @@ def test_weighted_residual_math():
         out = w(x, attention_mask=am)
         assert torch.allclose(out[0], x, atol=1e-5), "with r=0 the layer should be near-identity (residual passthrough)"
         # r = constant c: output = x + c·(block(x)−x)
-        c = 0.7
         # Approximating a constant r with a large weight vector: weight·x ≈ c requires x along a
         # fixed direction; directly editing _last_rlogits is not viable, and pre-hook nn
         # manipulation is not either;
@@ -94,7 +62,6 @@ def test_weighted_residual_math():
         manual = x + 1.0 * delta  # sel all 1, r=0 -> should equal x; also checks that the r!=0 path exists
         assert torch.allclose(out[0], x, atol=1e-5)
         assert not torch.allclose(manual, x, atol=1e-5), "delta is nonzero, full selection + weight 1 should change the output"
-    print("[PASS] weighted residual math")
 
 
 def test_forward_backward_and_stats():
@@ -124,11 +91,3 @@ def test_forward_backward_and_stats():
         o1 = fake(hidden_states=x, attention_mask=am)["logits"]
         o2 = fake(hidden_states=x, attention_mask=am)["logits"]
         assert torch.allclose(o1, o2)
-    print("[PASS] forward/backward + k stats + determinism")
-
-
-if __name__ == "__main__":
-    test_select_topk()
-    test_weighted_residual_math()
-    test_forward_backward_and_stats()
-    print("\nAll MoD baseline tests passed.")

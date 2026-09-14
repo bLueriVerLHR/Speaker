@@ -6,27 +6,30 @@ Tier-2 (opt-in --gen_n>0): repetition at the ckpt's own decode recipe (mod_confi
 decode block, ed9/C) vs dense under the SAME lever.
 Exit code 0 = PASS, 1 = FAIL (pipeline-friendly).
 Usage: accept.py --ckpt CKPT [--gen_n 10] (rest: model/data slice + thresholds)."""
-import argparse
-import gc
 import hashlib
 import json
 import os
 import pathlib
 import sys
+from typing import Annotated, Optional
 
-import torch
+import typer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from baselines.assemble import assemble
 from data.sft import make_collate
 from speaker.evaluate import eval_heldout
+from speaker.log import logger
+from tools.gen_metrics import seq_rep  # noqa: E402 (Welleck seq-rep-n)
+from tools._common import collect_gc, dump_json
 from speaker.train_common import (
     build_model,
     build_tok,
     eval_slice,
     resolve_device,
 )
+
+app = typer.Typer(add_completion=False)
 
 
 def md5_file(path: str) -> str:
@@ -37,117 +40,125 @@ def md5_file(path: str) -> str:
     return h.hexdigest()
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_id", default="/home/hdd/model/Qwen2.5-7B-Instruct")
-    p.add_argument("--data_path", default="./data/sft_t2t_mini.jsonl")
-    p.add_argument("--ckpt", required=True)
-    p.add_argument("--offset", type=int, default=904000, help="acceptance slice (default: training heldout)")
-    p.add_argument("--n", type=int, default=100)
-    p.add_argument("--max_len", type=int, default=1024)
-    p.add_argument("--batch_size", type=int, default=1, help="bs1 = honest accounting (modd lesson)")
-    p.add_argument("--acc_margin", type=float, default=0.0, help="PASS iff mod_acc >= dense_acc + margin")
-    p.add_argument("--k_max", type=float, default=None, help="PASS iff total-k mean <= this (None = skip)")
-    p.add_argument("--gen_n", type=int, default=0, help="tier-2 rep probe prompts (0 = skip)")
-    p.add_argument("--gen_offset", type=int, default=5000, help="gen protocol slice (established)")
-    p.add_argument("--gen_new", type=int, default=64)
-    p.add_argument("--gen_temp", type=float, default=0.7)
-    p.add_argument("--rep_max_mult", type=float, default=1.5, help="PASS iff ours_rep <= mult * dense_rep (same lever)")
-    p.add_argument("--use_lora", default=True, action=argparse.BooleanOptionalAction)
-    p.add_argument("--lora_rank", type=int, default=8)
-    p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--lora_targets", default="q_proj,v_proj")
-    p.add_argument("--device", default="cuda:0")
-    p.add_argument("--out", default="", help="manifest path (default: <ckpt>/manifest.json)")
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    device = resolve_device(args.device)
-    tok = build_tok(args.model_id)
-    texts = eval_slice(args.data_path, args.offset, args.n)
-    coll = make_collate(tok, device, args.max_len)
+@app.command()
+def main(
+    model_id: Annotated[str, typer.Option("--model_id")] = "/home/hdd/model/Qwen2.5-7B-Instruct",
+    data_path: Annotated[str, typer.Option("--data_path")] = "./data/sft_t2t_mini.jsonl",
+    ckpt: Annotated[str, typer.Option("--ckpt")] = ...,
+    offset: Annotated[int, typer.Option("--offset", help="acceptance slice (default: training heldout)")] = 904000,
+    n: Annotated[int, typer.Option("--n")] = 100,
+    max_len: Annotated[int, typer.Option("--max_len")] = 1024,
+    batch_size: Annotated[int, typer.Option("--batch_size", help="bs1 = honest accounting (modd lesson)")] = 1,
+    acc_margin: Annotated[float, typer.Option("--acc_margin", help="PASS iff mod_acc >= dense_acc + margin")] = 0.0,
+    k_max: Annotated[Optional[float], typer.Option("--k_max", help="PASS iff total-k mean <= this (None = skip)")] = None,
+    gen_n: Annotated[int, typer.Option("--gen_n", help="tier-2 rep probe prompts (0 = skip)")] = 0,
+    gen_offset: Annotated[int, typer.Option("--gen_offset", help="gen protocol slice (established)")] = 5000,
+    gen_new: Annotated[int, typer.Option("--gen_new")] = 64,
+    rep_max_mult: Annotated[float, typer.Option("--rep_max_mult", help="PASS iff ours_rep <= mult * dense_rep (same lever)")] = 1.5,
+    use_lora: Annotated[bool, typer.Option("--use_lora/--no-use_lora", help="LoRA wrapping switch (must match training; families adapt per ckpt config)")] = True,
+    lora_rank: Annotated[int, typer.Option("--lora_rank", help="same as the train.py default")] = 8,
+    lora_alpha: Annotated[int, typer.Option("--lora_alpha")] = 16,
+    lora_targets: Annotated[str, typer.Option("--lora_targets")] = "q_proj,v_proj",
+    device: Annotated[str, typer.Option("--device")] = "cuda:0",
+    device_map: Annotated[str, typer.Option("--device_map", help="empty = whole-card (default); 'auto' = sharding across all visible GPUs (backbones larger than one card, e.g. 27B; batch_size 1 recommended)")] = "",
+    out: Annotated[str, typer.Option("--out", help="manifest path (default: <ckpt>/manifest.json)")] = "",
+) -> None:
+    """PASS/FAIL a ckpt against the deployment contract; writes manifest.json."""
+    from speaker.terminal import setup_terminal
+    setup_terminal()
+    device = resolve_device(device)
+    tok = build_tok(model_id)
+    texts = eval_slice(data_path, offset, n)
+    coll = make_collate(tok, device, max_len)
     checks = []
+    lora = (dict(rank=lora_rank, alpha=lora_alpha, targets=lora_targets)
+            if use_lora else None)
 
-    dense = build_model(args.model_id, device)
+    dense = build_model(model_id, device,
+                        device_map=(device_map or None))
     dense.eval()
-    d = eval_heldout(dense, texts, coll, args.batch_size)
-    print(f"dense loss {d['loss']:.3f} acc {d['acc']:.3f}", flush=True)
+    d = eval_heldout(dense, texts, coll, batch_size)
+    logger.info(f"dense loss {d['loss']:.3f} acc {d['acc']:.3f}")
     # tier-2 lever = the ckpt's own recipe (read from disk first, no model needed);
     # dense is generated under the SAME lever (fair comparison, ed9/D contract)
     dec = {}
-    if args.gen_n > 0:
+    if gen_n > 0:
         try:
-            with open(os.path.join(args.ckpt, "mod_config.json"), encoding="utf-8") as f:
+            with open(os.path.join(ckpt, "mod_config.json"), encoding="utf-8") as f:
                 dec = json.load(f).get("decode") or {}
         except OSError:
             dec = {}
     rp = dec.get("repetition_penalty", 1.0)
     ng = dec.get("no_repeat_ngram_size", 0)
     reps, prompts = {}, None
-    if args.gen_n > 0:
+    if gen_n > 0:
         import eval_gen as eg
-        print(f"tier-2 rep probe under ckpt lever (rep_penalty={rp} no_repeat_ngram={ng}): "
-              f"{'ckpt-shipped' if dec else 'neutral fallback'}", flush=True)
-        gtexts = eval_slice(args.data_path, args.gen_offset, args.gen_n)
+        logger.info(f"tier-2 rep probe under ckpt lever (rep_penalty={rp} no_repeat_ngram={ng}): "
+                    f"{'ckpt-shipped' if dec else 'neutral fallback'}")
+        gtexts = eval_slice(data_path, gen_offset, gen_n)
         enc = tok(gtexts, truncation=True, max_length=64 + 64,
                   padding=True, return_tensors="pt")
         L = enc["attention_mask"].sum(1)
         prompts = [tok.decode(enc["input_ids"][bi, :L[bi]][:64].tolist(),
                               skip_special_tokens=True)
                    for bi in range(len(gtexts))]
-        outs, _, _, _, _, _, _ = eg.run_gen(
-            dense, tok, prompts, args.gen_new, device, "accept-dense",
-            args.gen_temp, rep_penalty=rp, no_repeat_ngram=ng)
-        reps["dense"] = sum(eg.rep3_rate(o) for o in outs) / max(len(outs), 1)
-        print(f"[accept-dense] rep3 {reps['dense']:.3f}", flush=True)
+        outs, _, _, _, _, _ = eg.run_gen(
+            dense, tok, prompts, gen_new, device, "accept-dense",
+            rep_penalty=rp, no_repeat_ngram=ng)
+        reps["dense"] = sum(seq_rep(o) for o in outs) / max(len(outs), 1)
+        logger.info(f"[accept-dense] seq-rep-4 {reps['dense']:.3f}")
     del dense
-    gc.collect()
-    torch.cuda.empty_cache()
+    collect_gc()
 
-    asm = assemble(args.ckpt, args.model_id, args, device=device, skip_mode="hard")
+    from baselines.assemble import ModelBuilder
+    asm = (ModelBuilder(model_id, lora, device_map=(device_map or None))
+           .from_ckpt(ckpt).skip_mode("hard")
+           .build(None if device_map else device))
     mod = asm.model
     mod.eval()
-    m = eval_heldout(mod, texts, coll, args.batch_size)
+    m = eval_heldout(mod, texts, coll, batch_size)
     n_fixed = len((asm.cfg or {}).get("always_on_layers", []))
     k_total = (m["mean_k"] or 0.0) + n_fixed
-    print(f"mod   loss {m['loss']:.3f} acc {m['acc']:.3f} "
-          f"(Δloss {m['loss'] - d['loss']:+.3f} Δacc {m['acc'] - d['acc']:+.3f}) "
-          f"| k_total {k_total:.1f} (gated {m['mean_k']:.1f}+fixed {n_fixed})", flush=True)
+    logger.info(f"mod   loss {m['loss']:.3f} acc {m['acc']:.3f} "
+                f"(Δloss {m['loss'] - d['loss']:+.3f} Δacc {m['acc'] - d['acc']:+.3f}) "
+                f"| k_total {k_total:.1f} (gated {m['mean_k']:.1f}+fixed {n_fixed})")
     checks.append({"name": "acc", "value": round(m["acc"] - d["acc"], 4),
-                   "threshold": f">= dense+{args.acc_margin}",
-                   "pass": bool(m["acc"] >= d["acc"] + args.acc_margin)})
-    if args.k_max is not None:
+                   "threshold": f">= dense+{acc_margin}",
+                   "pass": bool(m["acc"] >= d["acc"] + acc_margin)})
+    if k_max is not None:
         checks.append({"name": "k_total", "value": round(k_total, 3),
-                       "threshold": f"<= {args.k_max}", "pass": bool(k_total <= args.k_max)})
+                       "threshold": f"<= {k_max}", "pass": bool(k_total <= k_max)})
 
-    if args.gen_n > 0:
-        outs, _, _, _, _, _, _ = eg.run_gen(
-            mod, tok, prompts, args.gen_new, device, "accept-ours",
-            args.gen_temp, rep_penalty=rp, no_repeat_ngram=ng)
-        reps["ours"] = sum(eg.rep3_rate(o) for o in outs) / max(len(outs), 1)
-        print(f"[accept-ours] rep3 {reps['ours']:.3f}", flush=True)
+    if gen_n > 0:
+        outs, _, _, _, _, _ = eg.run_gen(
+            mod, tok, prompts, gen_new, device, "accept-ours",
+            rep_penalty=rp, no_repeat_ngram=ng)
+        reps["ours"] = sum(seq_rep(o) for o in outs) / max(len(outs), 1)
+        logger.info(f"[accept-ours] seq-rep-4 {reps['ours']:.3f}")
         checks.append({"name": "rep", "value": round(reps["ours"], 4),
-                       "threshold": f"<= {args.rep_max_mult}x dense({reps['dense']:.3f})@{dec or 'neutral'}",
-                       "pass": bool(reps["ours"] <= args.rep_max_mult * reps["dense"])})
+                       "threshold": f"<= {rep_max_mult}x dense({reps['dense']:.3f})@{dec or 'neutral'}",
+                       "pass": bool(reps["ours"] <= rep_max_mult * reps["dense"])})
     verdict = "PASS" if all(c["pass"] for c in checks) else "FAIL"
-    manifest = {"ckpt": args.ckpt, "verdict": verdict, "checks": checks,
+    manifest = {"ckpt": ckpt, "verdict": verdict, "checks": checks,
                 "dense": {"loss": d["loss"], "acc": d["acc"]},
                 "mod": {"loss": m["loss"], "acc": m["acc"],
                         "k_gated": m["mean_k"], "k_total": k_total},
-                "provenance": {"slice": [args.offset, args.n], "max_len": args.max_len,
-                               "gate_md5": md5_file(os.path.join(args.ckpt, "gate.pt")),
+                "provenance": {"slice": [offset, n], "max_len": max_len,
+                               "gate_md5": md5_file(os.path.join(ckpt, "gate.pt")),
                                "has_decode": bool((asm.cfg or {}).get("decode"))}}
-    out = args.out or os.path.join(args.ckpt, "manifest.json")
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=1)
-    print(f"[{verdict}] {args.ckpt} -> {out}", flush=True)
+    out = out or os.path.join(ckpt, "manifest.json")
+    dump_json(out, manifest)
+    if verdict == "PASS":
+        logger.info(f"[PASS] {ckpt} -> {out}")
+    else:
+        logger.warning(f"[FAIL] {ckpt} -> {out}")
     for c in checks:
-        print(f"  {c['name']}: {c['value']} ({c['threshold']}) "
-              f"{'ok' if c['pass'] else 'VIOLATED'}", flush=True)
+        if c["pass"]:
+            logger.info(f"  {c['name']}: {c['value']} ({c['threshold']}) ok")
+        else:
+            logger.warning(f"  {c['name']}: {c['value']} ({c['threshold']}) VIOLATED")
     sys.exit(0 if verdict == "PASS" else 1)
 
 
 if __name__ == "__main__":
-    main()
+    app()

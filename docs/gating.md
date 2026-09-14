@@ -147,6 +147,29 @@ k-capped choices (threshold).
 
 ---
 
+## Hybrid backbones (linear + full attention, e.g. Qwen3_5)
+
+The gate unit is the **decoder layer**, regardless of its attention kind — on
+hybrid stacks this means linear-attention layers are gated the same way
+(their recurrent/conv state simply freezes when skipped; decode-step detection
+answers via `Cache.has_previous_state` because `get_seq_length` raises for
+them). Two backbone-specific rules:
+
+1. **Position anchor** (`fix_position_anchor`, default on, new runs only):
+   transformers' `Cache.get_seq_length()` with no layer argument resolves to
+   the *first KV-tracking layer* and the model's global position/rope
+   bookkeeping advances off that layer's cache length. Gating that layer would
+   drift every later position, so when `layer_types` is known (captured from
+   the backbone config by `from_model_config`), the first non-`linear_attention`
+   layer is forced into `always_on_layers`. On traditional backbones this is
+   layer 0 — already fixed whenever head ≥ 1; legacy ckpts (no `layer_types`
+   in `mod_config.json`) are untouched.
+2. **Tail still required for the epilogue placement**: the final norm + lm_head
+   are placed on the GPU by the edge tooling, so the last decoder layer must
+   stay always-on (tail ≥ 1) — enforced loudly by `tools/edge_bench.py`.
+
+---
+
 ## Configuration quick reference
 
 | Key | Mode | Meaning |
@@ -156,7 +179,7 @@ k-capped choices (threshold).
 | `kmax` | both | hard cap on per-token k |
 | `gumbel_scale` | threshold | Gumbel noise scale while training the gate |
 | `always_on_layers` | both | `None` = derive (head/tail prior); `[]` = pure gating (gating-first mainline); list = explicit fixed set |
-| `sparsity_price` (λ), `acc_target` | both | dual-budget knobs: `acc_target` = `auto` (default, dense-referenced) / float / `none` (docs/training.md) |
+| `sparsity_price` (λ), `acc_target` | both | dual-budget knobs: `acc_target` = `none` (default, fixed price) / `auto` (dense-referenced) / float (docs/training.md) |
 
 Checkpoint formats: moe `gate.pt` stores `joint_router.*` only; threshold stores
 per-layer `router/tau/comp` (+ LoRA if used). `speaker/checkpoint.py` filters

@@ -1,9 +1,5 @@
 """Offline unit tests: accuracy ruler (valid masks / target derivation, P0) +
 dual controller cadence (P0.5)."""
-import pathlib
-import sys
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from speaker.evaluate import ema_update
@@ -22,7 +18,6 @@ def test_valid_positions():
         raise AssertionError("unknown mode must raise")
     except ValueError:
         pass
-    print("[PASS] valid_positions (labels/attention_mask equivalent-error)")
 
 
 def test_batch_accuracy_matches_history():
@@ -42,7 +37,6 @@ def test_batch_accuracy_matches_history():
     assert 0.0 < expected < 1.0, expected
     assert batch_accuracy(logits, b) == expected
     assert batch_accuracy(logits, b) == batch_accuracy(logits, b, mode="attention_mask")
-    print(f"[PASS] batch_accuracy == historical inline block ({expected:.4f})")
 
 
 def test_target_policy():
@@ -61,7 +55,6 @@ def test_target_policy():
     assert AccRuler.from_cli("none").resolve(0.9) is None
     r2 = AccRuler.from_cli("auto", margin=0.99)
     assert r2.resolve(0.5) == 0.0  # clamped at 0
-    print("[PASS] target policy (auto/fixed/none/fallback/clamp)")
 
 
 class _Cfg:
@@ -95,7 +88,6 @@ def test_dual_cadence():
     # warmup gate: adapt fires only for step > 3
     assert m.calls == [ema, ema], m.calls
     assert abs(cfg.sparsity_price - 0.03 * 1.01 * 1.01) < 1e-12
-    print("[PASS] dual cadence (ema identical, warmup gate, adapt math)")
 
 
 def test_difficulty_mult():
@@ -104,13 +96,3 @@ def test_difficulty_mult():
     # strict inequalities: boundaries belong to mid (1.0)
     assert m[0].tolist() == [2.0, 1.0, 1.0, 1.0, 0.5], m
     assert m.dtype == nll.dtype
-    print("[PASS] difficulty_mult (easy/mid/hard tiers, boundary ownership)")
-
-
-if __name__ == "__main__":
-    test_valid_positions()
-    test_batch_accuracy_matches_history()
-    test_target_policy()
-    test_dual_cadence()
-    test_difficulty_mult()
-    print("All ruler/dual tests passed.")

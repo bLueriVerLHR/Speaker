@@ -1,6 +1,6 @@
 # Training (both tracks)
 
-Two tracks share the core library and the RunLogger logging stack; they differ in
+Two tracks share the core library and the shared logger (speaker/log.py); they differ in
 how the fixed-layer set is born.
 
 - **Track A — pretrain (from scratch, design-first)**: fixed layers come from a
@@ -53,16 +53,32 @@ ema_acc < acc_target  ⇒  λ ← λ · relax      # buy layers back for hard to
 ema_acc ≥ acc_target  ⇒  λ ← λ · tighten    # push sparsity while accuracy holds
 ```
 
-`--acc_target` (ed7): `auto` (default) derives the floor from the dense baseline
+`--acc_target` (ed7): `auto` derives the floor from the dense baseline
 measured on the same slice/protocol (`dense_acc − --acc_margin`), so the
 sparsity/accuracy tradeoff is anchored to the same starting line however the
 base/slice/protocol changes; a plain float pins the legacy absolute floor;
-`none` disables the dual. One accuracy scale (`speaker/ruler.py`) feeds the dual,
+`none` (default since r8c) disables the dual and holds `--sparsity_price` fixed.
+One accuracy scale (`speaker/ruler.py`) feeds the dual,
 the plateau eval and the final report — all `labels` accounting.
 
 `price_warmup` delays the price's start; `budget_ramp` ramps it in. The price
 semantic is the **per-inference actual demand** (per-token average active-layer
 memory, avg not peak) — the number a decoding loop actually has to provision.
+
+### Budget shape (r8 ablation: `--budget_form`)
+
+Which statistic of k the price presses (`speaker/hub.py::_budget_core`, both
+schemes; `budget_target=0` auto-resolves to `kmax`):
+
+- `mean` (default, legacy): `λ·mean(k)` — uniform downward pressure;
+- `hinge`: `λ·max(0, mean−T)` — parks mean at setpoint T (below T the dual
+  tightening is a no-op; λ may ratchet to `price_max`, harmless);
+- `tail`: `λ·mean + λ·tail_coef·P(k>B)` — SLO-style, mean pressure plus a
+  sigmoid-counted tail-violation rate (`--tail_temp` softness).
+
+All three keep ∂L/∂k ≥ 0 so the dual lever stays connected. Deliberately
+excluded: 1/var-style shapes — batch variance rewards polarized (bimodal)
+collapse (the r1 MoD pathology) and disconnect `adapt_price`.
 
 ### Difficulty-conditioned budget (ed8, bimodal separator)
 
@@ -90,7 +106,8 @@ its logits while paying the depth price. This is the single biggest accuracy lev
 
 Sparse decode has a repetition attractor; the remedies live in `speaker/ul.py`
 (shared mechanism library, both gate schemes), wired into `finetune/train.py`
-(`--ul_mode rollout` is the default since ed7; `none` restores the legacy off):
+(`--ul_mode rollout` is the default since ed7, `--rollout_tokens 128` since r8c;
+`none` restores the legacy off):
 
 - `--ul_mode gt`: n-gram unlikelihood on ground-truth repeats (rep3 −57%, but
   depth relaxes k 7.4→11.1 — sparsity pays for it);
@@ -105,12 +122,29 @@ can otherwise "converge" straight into a repetition attractor.
 ## Track B loop
 
 ```
-B1  gating-first finetune      (LoRA joint train + KL + dual + rollout UL by default)
+B1  gating-first finetune      (LoRA joint train + fixed price + rollout-128 UL by default)
 B2  profile measured load      finetune/profile_layers.py
-      -> promote layers with load >= threshold (default 0.9) to fixed
-      -> new ckpt (promoted keys dropped from gate.pt, router re-init on resume)
+       -> promote layers with load >= threshold (default 0.9) to fixed
+       -> new ckpt (promoted keys dropped from gate.pt, router re-init on resume)
 B3  resume on the new structure (fixed + remaining gated)
 ```
+
+Default recipe (r8c/long_4k, validated 0914 on Qwen2.5-7B full-SFT × 4000 steps):
+`--gate_mode threshold --kmax 16 --sparsity_price 0.0005 --acc_target none`
+`--ul_mode rollout --rollout_tokens 128 --ul_coef 0.3`
+→ held-out Δacc +4.3pt at k 16.1/28 (weight −42%, KV −41%), 128tok
+ROUGE-L ≈ dense, seq-rep-4 0.22 vs dense 0.07 (residual is a shared
+multi-turn dialogue-loop data artifact, also present in dense-like baselines).
+
+### Backbones larger than one card (`--device_map auto`)
+
+`finetune/train.py --device_map auto` shards the backbone across all visible
+GPUs via accelerate (27B bf16 needs ≥ 3 × 24GB for LoRA training); inputs stay
+on `--device` and the metrics layer device-aligns labels to wherever `lm_head`
+lands. On hybrid (linear+full attention) backbones, extend the LoRA targets to
+the linear projections — `q_proj,v_proj` alone only touches the full-attention
+layers (e.g. `--lora_targets q_proj,v_proj,in_proj_qkv,in_proj_z,out_proj` for
+Qwen3_5), see docs/gating.md "Hybrid backbones" for the anchor rule.
 
 CLI semantics (note: `--anneal_steps` is the *annealing horizon*, NOT a stop
 condition — stopping is `--max_steps` only, enforced via StopOnPlateau):
@@ -141,14 +175,24 @@ python3 pretrain/train.py --device cuda:0 --max_steps 500 --max_samples 1000 \
 
 (`--max_steps` is a true stop in pretrain, as in all scripts.)
 
-## Logging (RunLogger)
+## Logging (speaker/log.py, loguru-based)
+
+The primary development logger — training scripts are ordinary users of it.
+Each entry point calls `setup_logger(run_dir=save_dir)` first, then declares
+the files it needs via `add_jsonl`. The logger owns all routing; nothing is
+piped through `tee`.
 
 Every training run writes, into the checkpoint directory:
 
+- `run.log` — the human stream mirror (console output with module:line, levels
+  INFO/WARNING/ERROR; read this first when diagnosing a run);
 - `metrics.jsonl` — all numeric state per `log_interval` (lm/acc/k±std/sparsity/
   price/λ/memory/throughput …) — plot and analyze straight from this file;
 - `layers.jsonl` — per-layer execution rates at plateau checkpoints (the profile
   input for promotion);
-- stdout — one-line status per interval.
+- `converge.jsonl` — plateau eval history (`tools/plot_converge.py` reads this).
 
-`converge.jsonl` (eval history) is written by the train scripts themselves.
+Separation rule: records emitted via `emit(key, ...)` go only to their JSONL
+sink; `logger.info/warning/exception` go to console + `run.log`. Console output
+is still streamed (visible in `neu-sbox result`), but persistence is the
+logger's job — the submit template carries no `tee`.

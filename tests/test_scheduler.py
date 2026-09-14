@@ -11,43 +11,7 @@ from speaker.load_profile import estimate_layer_bytes
 from speaker.scheduler import STRATEGIES, LayerScheduler, select_gated_resident
 
 
-class FakeDecoderLayer(torch.nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.self_attn = torch.nn.Identity()
-        self.mlp = torch.nn.Sequential(torch.nn.Linear(hidden_size, hidden_size),
-                                       torch.nn.SiLU(),
-                                       torch.nn.Linear(hidden_size, hidden_size))
-
-    def forward(self, hidden_states, attention_mask=None, **kwargs):
-        out = hidden_states + self.mlp(hidden_states) * 0.1
-        if kwargs.get("use_cache"):
-            return (out, kwargs.get("past_key_value"))
-        return (out,)
-
-
-class FakeHF(torch.nn.Module):
-    def __init__(self, n=8, h=32):
-        super().__init__()
-        self.config = type("Cfg", (), {"num_hidden_layers": n, "hidden_size": h})()
-        self.model = type("M", (), {})()
-        self.model.layers = torch.nn.ModuleList([FakeDecoderLayer(h) for _ in range(n)])
-        self.lm_head = torch.nn.Linear(h, 100)
-
-    def forward(self, hidden_states=None, input_ids=None, attention_mask=None, **kwargs):
-        if hidden_states is None:
-            hidden_states = torch.randn(2, 8, 32)
-        for layer in self.model.layers:
-            hidden_states = layer(hidden_states, attention_mask=attention_mask, **kwargs)[0]
-        return {"logits": self.lm_head(hidden_states)}
-
-
-def force_onehot(mod, slot: int):
-    mod.eval()
-    mod.set_skip_mode("soft")
-    mod.joint_router.net.weight.data.zero_()
-    mod.joint_router.layer_bias.data.fill_(0.0)
-    mod.joint_router.layer_bias.data[slot] = 50.0
+from tests._fakes import FakeHF, force_onehot
 
 
 def test_select_random():
@@ -60,7 +24,6 @@ def test_select_random():
     assert len(rk) == 1, "k caps the chosen count"
     rk0 = select_gated_resident("random", [2, 3, 4, 5], sizes, 400, rng=random.Random(1), k=0)
     assert rk0 == [], "k=0 schedules nothing"
-    print(f"[PASS] select random (seeded, budget, k cap) {r1}")
 
 
 def test_select_lfu():
@@ -71,7 +34,6 @@ def test_select_lfu():
     # no observations: ties break toward the lower index (deterministic, no thrashing)
     r0 = select_gated_resident("lfu", [2, 3, 4, 5], sizes, 200)
     assert r0 == [2, 3], f"no-data fallback must be index order, got {r0}"
-    print(f"[PASS] select lfu (top-k by count, index-order fallback) {r}")
 
 
 def test_select_lru():
@@ -79,7 +41,6 @@ def test_select_lru():
     r = select_gated_resident("lru", [2, 3, 4, 5], sizes, 200,
                               last_used={2: 3, 3: -1, 4: 5, 5: 1})
     assert r == [2, 4], f"lru keeps the most recently used (4 then 2), got {r}"
-    print(f"[PASS] select lru (recent-first, never-used last) {r}")
 
 
 def test_select_greedy_skip():
@@ -88,7 +49,6 @@ def test_select_greedy_skip():
     r = select_gated_resident("lfu", [2, 3, 4], sizes, 120,
                               freq={2: 9.0, 3: 5.0, 4: 1.0})
     assert r == [2, 4], f"greedy packing must skip oversized and keep fitting, got {r}"
-    print(f"[PASS] select greedy packing (skip oversized, fill smaller) {r}")
 
 
 def test_select_invalid():
@@ -98,7 +58,6 @@ def test_select_invalid():
             raise AssertionError(f"should reject {bad}")
         except ValueError:
             pass
-    print("[PASS] select invalid args rejected")
 
 
 def _wrapped(n=8, h=32):
@@ -150,8 +109,6 @@ def test_scheduler_flow():
     n_applied = len(applied)
     sched.reschedule()
     assert len(applied) == n_applied, "unchanged plan must not re-apply"
-    print(f"[PASS] scheduler flow (initial -> harvest -> LFU reschedule -> no-op) "
-          f"{sched.describe()}")
 
 
 def test_scheduler_fixed_too_big():
@@ -164,7 +121,6 @@ def test_scheduler_fixed_too_big():
         raise AssertionError("fixed layers not fitting the budget must raise")
     except ValueError:
         pass
-    print("[PASS] scheduler fixed-layers-too-big rejected")
 
 
 def test_scheduler_k_cap():
@@ -175,17 +131,7 @@ def test_scheduler_k_cap():
                                    reserve_gb=total / 1e9, gpu_device="cpu",
                                    cpu_device="cpu", seed=0)
     assert sched.resident == cfg.always_on_layers, "k=0 keeps only the fixed layers"
-    print("[PASS] scheduler k=0 (fixed-only residency)")
 
 
-if __name__ == "__main__":
-    test_select_random()
-    test_select_lfu()
-    test_select_lru()
-    test_select_greedy_skip()
-    test_select_invalid()
-    test_scheduler_flow()
-    test_scheduler_fixed_too_big()
-    test_scheduler_k_cap()
+def test_strategies_registry():
     assert STRATEGIES == ("random", "lru", "lfu")
-    print("\nAll scheduler tests passed.")

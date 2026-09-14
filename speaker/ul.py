@@ -13,7 +13,7 @@ repetition metrics existed only post-hoc in tools/eval_gen.py. Centralizing here
 - gt_repeat_rate gives the training loop a near-zero-cost visibility signal
   (logged as rep_gt at log cadence);
 - rollout_rep3_probe resurrects the r4 gen-probe: a tiny hard-greedy rollout at
-  plateau beats, reported as a RunLogger event (trend-only, 5 prompts is noisy);
+  plateau beats, reported as a logger event (trend-only, 5 prompts is noisy);
   restores skip_mode/train state and draws no RNG (greedy, eval mode), so training
   numerics are untouched.
 """
@@ -51,7 +51,7 @@ def unlikelihood_loss(logits, targets, trigger) -> torch.Tensor:
     if idx.numel() == 0:
         return logits.new_zeros(())
     rows = logits[idx[:, 0], idx[:, 1]].float()
-    tgt = targets[idx[:, 0], idx[:, 1]]
+    tgt = targets[idx[:, 0], idx[:, 1]].to(rows.device)  # device-align (no-op single-device)
     p = rows.softmax(-1).gather(-1, tgt[:, None]).squeeze(-1)
     return -(1 - p).clamp_min(1e-6).log().mean()
 

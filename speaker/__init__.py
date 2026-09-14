@@ -17,7 +17,9 @@ MoDConfig/MoDLayerWrapper/MoDModelWrapper/convert_to_mod are import aliases.
 """
 from .config import SpeakerConfig
 from .gating import Router, JointRouter, RouteDecision, select_and_weight, GatingOutput
-from .wrapper import SpeakerLayerWrapper, SpeakerModelWrapper, convert_to_speaker, apply_decode_config
+from .layer import SpeakerLayerWrapper
+from .hub import SpeakerModelWrapper, convert_to_speaker, apply_decode_config
+from .strategies import MoeStrategy, ThresholdStrategy  # noqa: F401 (P1 polymorphism seam)
 from .scheduler import LayerScheduler
 from .metrics import per_token_nll, per_token_correct, estimate_act_mb, distill_kl_loss
 
@@ -31,7 +33,9 @@ convert_to_mod = convert_to_speaker
 __all__ = [
     "SpeakerConfig", "Router", "JointRouter", "RouteDecision", "select_and_weight",
     "GatingOutput",
-    "SpeakerLayerWrapper", "SpeakerModelWrapper", "convert_to_speaker", "LayerScheduler",
+    "SpeakerLayerWrapper", "SpeakerModelWrapper", "convert_to_speaker",
+    "apply_decode_config", "LayerScheduler",
+    "MoeStrategy", "ThresholdStrategy",
     # compatibility aliases
     "MoDConfig", "MoDLayerWrapper", "MoDModelWrapper", "convert_to_mod",
     "per_token_nll", "per_token_correct", "estimate_act_mb", "distill_kl_loss",

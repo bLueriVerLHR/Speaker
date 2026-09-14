@@ -13,7 +13,8 @@ what a token's execution actually requires,
 - **KV cache**: `k × bytes-per-layer-KV` at the serving context length
   (MB/token; 31.2 vs 57.3 at 1024 ctx → −46%).
 
-`tools/mem_demand.py` aggregates this from `probe_kdist` JSONs. Process-level
+Aggregate this from `probe_kdist` JSONs (the one-off `tools/mem_demand.py`
+aggregator is archived). Process-level
 `peak_gb/avg_gb` from sequential single-process evals is allocator-polluted and
 stays diagnostic-only. Demand is also what the scheduler below budgets against.
 
@@ -67,6 +68,22 @@ sched = model.schedule_placement("lfu", gpu_total_gb=18, reserve_gb=4)
 for req in requests:
     out = model.generate(**req)
     sched.reschedule()      # between generations only
+```
+
+### Edge benchmark (`tools/edge_bench.py`)
+
+End-to-end Mode-3 benchmark against a backbone **larger than the card** (the
+whole model lives in host RAM): IO modules (embeddings / final norm / lm_head)
+are placed on the GPU first and count against the budget, the scheduler packs
+fixed + hot gated layers into the remainder, and the resident set is re-planned
+every `--reschedule_every` generations. Reports ms/token, resident weights GB,
+GPU peak, ROUGE-L/rep3 on a fresh slice (same prompt construction as
+`tools/eval_gen.py`). Requires tail ≥ 1 (the norm/lm_head epilogue needs the
+hidden state to arrive on the GPU); pin cores via `taskset` + `--threads`.
+
+```bash
+taskset -c 0-15 python3 tools/edge_bench.py --ckpt CKPT --model_id MODEL \
+    --gpu_budget_gb 20 --reserve_gb 2 --strategy lfu --n 20 --max_new 128
 ```
 
 ### Budget accounting

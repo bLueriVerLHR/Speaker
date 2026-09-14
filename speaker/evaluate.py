@@ -3,13 +3,49 @@ injected by the caller)."""
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
-from .metrics import per_token_correct, per_token_nll
 from .ruler import valid_positions
+from .terminal import track
+
+# Sequence chunk for the eval CE/argmax: a full fp32 logits copy (B*T*V*4B,
+# ~1.2GB @bs2x1024x152k) OOMs once optimizer states are resident post-train.
+_EVAL_TOK_CHUNK = 256
+
+
+def chunked_nll_correct(logits: torch.Tensor, labels: torch.Tensor):
+    """Memory-capped per-token NLL [B,T] (fp32) + correct mask [B,T] (bool).
+
+    Same layout/semantics as metrics.per_token_{nll,correct} (source position t
+    predicts labels[t+1]; trailing position holds 0/False) but the fp32 CE and
+    argmax run in T-chunks, so peak memory is O(B*chunk*V) instead of O(B*T*V).
+    Shared by eval_heldout and the probe tools (probe_kdist/probe_nll_ablation).
+    """
+    B, T, V = logits.shape
+    dev = logits.device
+    nll = torch.zeros(B, T, device=dev)
+    corr = torch.zeros(B, T, dtype=torch.bool, device=dev)
+    tgt_full = labels.to(dev)
+    for s in range(0, T - 1, _EVAL_TOK_CHUNK):
+        e = min(s + _EVAL_TOK_CHUNK, T - 1)
+        p = logits[:, s:e].float()
+        tgt = tgt_full[:, s + 1:e + 1]
+        n = F.cross_entropy(p.reshape(-1, V), tgt.reshape(-1), reduction="none",
+                            ignore_index=-100)
+        nll[:, s:e] = n.reshape(B, e - s)
+        corr[:, s:e] = (p.argmax(-1) == tgt) & (tgt != -100)
+        del p, n
+    return nll, corr
 
 
 def ema_update(prev, value, beta=0.95):
     return value if prev is None else beta * prev + (1 - beta) * value
+
+
+def format_k_quartile(res) -> str:
+    """One-line k summary shared by the terminal held-out reports."""
+    return (f"k {res['mean_k']:.1f}±{res['std_k']:.1f} "
+            f"quartile {[round(v, 1) for v in res['quartile_k']]}")
 
 
 def eval_heldout(model, texts, collate_fn, batch_size=4,
@@ -36,34 +72,48 @@ def eval_heldout(model, texts, collate_fn, batch_size=4,
     quart = [0.0] * 4
     qn = [0] * 4
     with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
+        for i in track(range(0, len(texts), batch_size),
+                       total=(len(texts) + batch_size - 1) // batch_size,
+                       desc="heldout"):
             b = collate_fn(texts[i:i + batch_size])
             out = model(**b)
-            logits = out.logits.float()
-            nll = per_token_nll(logits, b["labels"])
-            correct = per_token_correct(logits, b["labels"])
-            valid = valid_positions(b, valid_mode)
+            # NOTE: no full-tensor .float() — materializing B*T*V fp32 OOMs
+            # post-train (optimizer resident); see chunked_nll_correct.
+            lg = out.logits
+            # sharded backbones: logits may land on the last card while labels stay on
+            # the input device — index with a mask that followed the logits (no-op single)
+            valid = valid_positions(b, valid_mode).to(lg.device)
+            nll, correct = chunked_nll_correct(lg, b["labels"])
             sum_nll += nll[valid].sum().item()
             n_tok += valid.sum().item()
             n_ok += correct[valid].sum().item()
+            del nll, correct
             if k_provider is not None:
                 k = k_provider(b)
             else:
                 getk = getattr(model, "get_active_counts", None)
                 k = getk() if callable(getk) else None
             if k is not None:
-                kv = k[valid].float()
+                kv = k.to(valid.device)[valid].float()
                 sum_k += kv.sum().item()
                 sum_k2 += (kv * kv).sum().item()
+                # quartile bins, vectorized (identical math to the old
+                # per-position loop: q = min(3, t*4 // max(L-1, 1))).
                 B, T = b["input_ids"].shape
+                tidx = torch.arange(T, device=valid.device)
                 for bi in range(B):
-                    L = valid[bi].sum().item()
-                    for t in range(T):
-                        if not valid[bi, t]:
-                            continue
-                        q = min(3, int(t / max(L - 1, 1) * 4))
-                        quart[q] += k[bi, t].item()
-                        qn[q] += 1
+                    vb = valid[bi]
+                    L = int(vb.sum())
+                    if not L:
+                        continue
+                    qb = ((tidx[vb] * 4) // max(L - 1, 1)).clamp_max(3)
+                    kb = k[bi][vb].double()
+                    qa = torch.zeros(4, dtype=torch.float64,
+                                     device=valid.device).index_add_(0, qb, kb)
+                    na = torch.bincount(qb, minlength=4)
+                    for q in range(4):
+                        quart[q] += float(qa[q])
+                        qn[q] += int(na[q])
     if was_training:
         model.train()
     res = {"loss": sum_nll / max(n_tok, 1), "acc": n_ok / max(n_tok, 1)}

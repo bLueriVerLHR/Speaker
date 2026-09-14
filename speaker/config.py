@@ -68,6 +68,11 @@ class SpeakerConfig:
     acc_target: Optional[float] = 0.55  # per-token accuracy floor; below it, relax sparsity
     adapt_rate: float = 0.01       # at most 1% per step, slow dual adjustment to avoid exponential blowup
     price_warmup_steps: int = 100  # λ frozen during warmup, waiting for the EMA to stabilize
+    # ---- Budget shape (r8 ablation): which statistic of k the price presses ----
+    budget_form: str = "mean"  # mean (legacy λ·mean) | hinge (λ·max(0,mean−T): parks mean at setpoint T) | tail (λ·mean + λ·tail_coef·P(k>B): SLO-style tail pressure)
+    budget_target: float = 0.0  # hinge setpoint T / tail budget B; 0 = auto → kmax
+    tail_coef: float = 1.0  # tail-violation weight relative to the mean term
+    tail_temp: float = 0.5  # sigmoid softness for the P(k>B) counter
     mem_bytes_per_hidden: float = 28.0  # activation byte coefficient per token·layer·hidden (bf16 calibrated empirically)
     # ---- Difficulty-conditioned budget (ed8, both schemes): per-token λ shaping ----
     diff_easy_nll: float = 0.5   # frozen-teacher NLL below this = easy token (grounded: p33 on the SFT slice)
@@ -88,6 +93,11 @@ class SpeakerConfig:
     z_loss_coef: float = 0.001       # squared penalty on router logits
     # ---- Training ----
     skip_mode: str = "soft"  # soft for training (hard selection in forward), hard for deployment (layer skipping saves memory)
+    # ---- Hybrid backbones (v0.2, linear+full attention mixes e.g. Qwen3_5) ----
+    layer_types: Optional[List[str]] = None  # per-layer attention kind from the backbone config
+    # ("linear_attention"/"full_attention"/...); None = traditional all-attention backbone
+    fix_position_anchor: bool = True  # force the cache's position-anchor layer always-on (see below)
+
     # ---- Deployment (inference recipe baked into the ckpt, ed9/C) ----
     decode: Optional[dict] = None  # None = legacy (no shipped recipe); e.g.
         # {"repetition_penalty": 1.15, "no_repeat_ngram_size": 3} (validated 0911:
@@ -111,12 +121,34 @@ class SpeakerConfig:
                 list(range(max(N - max(self.always_on_tail, 0), 0), N))
         self.always_on_layers = sorted(
             set(i for i in self.always_on_layers if 0 <= i < self.num_hidden_layers))
+        # Position anchor (v0.2): transformers' Cache.get_seq_length() with no layer arg
+        # resolves to the FIRST KV-tracking layer (layer 0 on traditional backbones, the
+        # first full_attention layer on linear/full hybrids) and the model's position/rope
+        # bookkeeping for the next decode token advances off that layer's cache length.
+        # If the anchor layer is gated and skipped, every subsequent position drifts —
+        # so on hybrid backbones the anchor is forced into the fixed set. Only applies when
+        # layer_types is known (new runs); legacy ckpts (no layer_types field) are unaffected.
+        if self.fix_position_anchor and self.layer_types is not None and \
+                len(self.layer_types) == self.num_hidden_layers:
+            for i, t in enumerate(self.layer_types):
+                if t != "linear_attention":
+                    if i not in self.always_on_layers:
+                        self.always_on_layers = sorted(set(self.always_on_layers) | {i})
+                    break
         if self.skip_mode not in SKIP_MODES:
             raise ValueError(f"skip_mode must be one of {SKIP_MODES}, got {self.skip_mode!r}")
         if self.gate_mode not in GATE_MODES:
             raise ValueError(f"gate_mode must be one of {GATE_MODES}, got {self.gate_mode!r}")
         if self.sparsity_price < 0:
             raise ValueError(f"sparsity_price must be >= 0, got {self.sparsity_price}")
+        if self.budget_form not in ("mean", "hinge", "tail"):
+            raise ValueError(f"budget_form must be mean|hinge|tail, got {self.budget_form!r}")
+        if self.budget_target < 0:
+            raise ValueError(f"budget_target must be >= 0, got {self.budget_target}")
+        if self.tail_coef < 0:
+            raise ValueError(f"tail_coef must be >= 0, got {self.tail_coef}")
+        if self.tail_temp <= 0:
+            raise ValueError(f"tail_temp must be > 0, got {self.tail_temp}")
         if not 0.0 <= self.diff_easy_nll <= self.diff_hard_nll:
             raise ValueError(f"need 0 <= diff_easy_nll <= diff_hard_nll, got "
                              f"{self.diff_easy_nll}/{self.diff_hard_nll}")
@@ -181,17 +213,27 @@ class SpeakerConfig:
 
     @classmethod
     def from_model_config(cls, hf_config, **overrides) -> "SpeakerConfig":
+        # Nested-text backbones (VL / multimodal, e.g. Qwen3_5): the decoder stack lives in
+        # text_config — unwrap before reading N/H/layer_types
+        if hasattr(hf_config, "text_config") and hf_config.text_config is not None:
+            hf_config = hf_config.text_config
+        elif isinstance(hf_config, dict) and isinstance(hf_config.get("text_config"), dict):
+            hf_config = hf_config["text_config"]
         if isinstance(hf_config, dict):
             n = hf_config.get("num_hidden_layers")
             h = hf_config.get("hidden_size")
+            lts = hf_config.get("layer_types")
         else:
             n = getattr(hf_config, "num_hidden_layers", None)
             h = getattr(hf_config, "hidden_size", None)
+            lts = getattr(hf_config, "layer_types", None)
         if n is None or h is None:
             raise ValueError(
                 f"cannot infer num_hidden_layers/hidden_size from the given config "
                 f"(got N={n!r}, H={h!r}); pass them explicitly via overrides")
         base = dict(num_hidden_layers=n, hidden_size=h)
+        if isinstance(lts, (list, tuple)) and len(lts) == n:
+            base["layer_types"] = list(lts)
         base.update(overrides)
         return cls(**base)
 

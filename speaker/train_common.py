@@ -6,8 +6,12 @@ smoke metrics bit-identical).
 """
 from __future__ import annotations
 
+import random
+
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
+
+from .log import logger
 
 # Name markers of gating parameters in named_parameters (baseline models only have router;
 # the other markers never match)
@@ -20,10 +24,10 @@ def resolve_device(name: str) -> torch.device:
     device = torch.device(name)
     if device.type == "cuda":
         torch.cuda.set_device(device)
-        print(f"Using {device} free {torch.cuda.mem_get_info(device)[0] / 1024**3:.1f}GB",
-              flush=True)
+        logger.info(f"Using {device} free "
+                    f"{torch.cuda.mem_get_info(device)[0] / 1024**3:.1f}GB")
     else:
-        print(f"Using {device}", flush=True)
+        logger.info(f"Using {device}")
     return device
 
 
@@ -38,11 +42,28 @@ def build_tok(model_id: str):
     return tok
 
 
-def build_model(model_id: str, device: torch.device, dtype=torch.bfloat16):
-    """Loads the base model (device_map=None whole-card placement, consistent with history)."""
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=dtype, device_map=None,
-        trust_remote_code=True, low_cpu_mem_usage=True).to(device)
+def build_model(model_id: str, device: torch.device, dtype=torch.bfloat16,
+                device_map=None):
+    """Loads the base model. device_map=None (default) = whole-card placement (.to(device),
+    consistent with history); device_map="auto" = accelerate sharding across all visible GPUs
+    for backbones larger than one card (e.g. 27B on 24GB cards) — no .to(device), the training
+    loop must then keep inputs on the first device and tolerate logits landing on the last.
+    Nested-text (VL/multimodal) backbones load through AutoModelForImageTextToText: the vision
+    tower stays in the way (inert without pixel_values), the decoder stack is what we gate."""
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    if getattr(cfg, "text_config", None) is not None:
+        from transformers import AutoModelForImageTextToText
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id, dtype=dtype, device_map=device_map,
+            trust_remote_code=True, low_cpu_mem_usage=True)
+    else:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=dtype, device_map=device_map,
+            trust_remote_code=True, low_cpu_mem_usage=True)
+    if device_map is None:
+        model = model.to(device)
     return model
 
 
@@ -78,22 +99,35 @@ def wrap_lora(model, rank: int = 8, alpha: int = 16, targets: str = "q_proj,v_pr
 
 
 def build_param_groups(mod_model, lr: float, router_lr: float,
-                       freeze_base: bool = False, freeze_gate: bool = False,
                        gate_keys=GATE_KEYS):
-    """Base/gating parameter grouping. freeze_base = finetune the router (gating) only;
-    freeze_gate = train the base only (ablation). named_parameters auto-deduplicates the
-    hf_model/layers dual registration paths; a single pass suffices."""
+    """Base/gating parameter grouping (joint training). named_parameters
+    auto-deduplicates the hf_model/layers dual registration paths; a single pass suffices."""
     base_params = [p for n, p in mod_model.named_parameters()
                    if not any(k in n for k in gate_keys)]
     gate_params = mod_model.get_router_parameters()
-    if freeze_base:
-        for p in base_params:
-            p.requires_grad_(False)
-        groups = [{"params": gate_params, "lr": router_lr}]
-    elif freeze_gate:
-        for p in gate_params:
-            p.requires_grad_(False)
-        groups = [{"params": base_params, "lr": lr}]
-    else:
-        groups = [{"params": base_params, "lr": lr}, {"params": gate_params, "lr": router_lr}]
+    groups = [{"params": base_params, "lr": lr}, {"params": gate_params, "lr": router_lr}]
     return groups, base_params, gate_params
+
+
+def parse_csv_list(s: str) -> list:
+    """Comma-separated int list (e.g. --always_layers); blank entries skipped."""
+    return [int(x) for x in (s or "").split(",") if x.strip() != ""]
+
+
+def seed_all(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def build_optimizer(groups, weight_decay: float = 0.01):
+    return torch.optim.AdamW(groups, weight_decay=weight_decay)
+
+
+def enable_checkpointing(model, use_lora: bool = False):
+    """Gradient checkpointing + the LoRA frozen-embed fix; no-op without support."""
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if use_lora:
+            # peft: with a frozen base, checkpointing requires inputs to carry
+            # gradients, otherwise backward breaks (frozen-embed pitfall)
+            model.enable_input_require_grads()

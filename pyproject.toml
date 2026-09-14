@@ -1,0 +1,54 @@
+[project]
+name = "speaker"
+version = "0.2.0"
+description = "Speaker: fixed (shared) layers + gated layers for edge-side efficient LLM inference (per-token layer skipping, sparse KV cache, GPU/CPU residency scheduling)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.4",
+    "transformers>=5.0",
+    "peft>=0.13",
+    "tokenizers",
+    "accelerate>=0.30",
+    "safetensors>=0.4",
+    "typer>=0.9",
+    "rich>=13",
+    "pydantic>=2",
+    "loguru>=0.7",
+    "rouge-score>=0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "vulture>=2"]
+plot = ["matplotlib"]
+extended = ["hydra-core>=1.3", "datasets>=2"]
+
+[tool.paths]
+# tests and tools import the repo root as a namespace (PYTHONPATH=.); keep that working
+# under pytest without conftest magic
+pythonpath = ["."]
+
+[tool.pytest.ini_options]
+# Offline suites only by default; on-device smokes (test_speaker_real needs local
+# weights, test_scheduler_gpu needs a GPU) run via tools/ci.sh or manually.
+addopts = "-q"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "baselines/mixture-of-depths",  # third-party, read-only
+    "baselines/router-tuning",      # third-party, read-only
+]
+
+[tool.ruff.lint]
+# Conservative rule set: real defects (E9 syntax/IO, F pyflakes) + style that does not
+# force reformatting of the historical codebase. Widen deliberately, not wholesale.
+# NOT gated: C901/PLR0912 complexity (18 grandfathered violations, mostly mains:
+# finetune main C901 41, config __post_init__ 26, eval_gen main 28; fixing them means
+# refactoring hot paths). Dead code IS gated instead: vulture --min-confidence 100
+# in tools/ci.sh (clean as of the audit cleanup).
+select = ["E9", "F", "W6"]

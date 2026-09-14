@@ -2,67 +2,64 @@
 held-out loss/acc drops.
 Used to validate the "syntax at the ends, logic in the middle" hypothesis and to guide
 shared (fixed) layer selection."""
-import argparse, json
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import os, sys
+import sys
 from pathlib import Path as _P
+from typing import Annotated
+
+import torch
+import typer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
 from data.sft import SFTDataset, make_collate
 from speaker.evaluate import eval_heldout
+from speaker.log import logger
+from tools._common import dump_json, find_layers, passthrough_hook
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model_id", default="/home/hdd/model/Qwen2.5-7B-Instruct",
-                   help="same as the finetune-track default (7B)")
-    p.add_argument("--data_path", default="./data/sft_t2t_mini.jsonl")
-    p.add_argument("--offset", type=int, default=1000, help="held-out start (offset from the training set)")
-    p.add_argument("--n", type=int, default=100)
-    p.add_argument("--device", default="cuda:0")
-    p.add_argument("--out", default="/tmp/layer_probe.json")
-    return p.parse_args()
+app = typer.Typer(add_completion=False)
 
-def find_layers(model):
-    for path in (["model", "layers"], ["transformer", "h"], ["layers"]):
-        cur = model
-        try:
-            for a in path: cur = getattr(cur, a)
-            return cur
-        except AttributeError: pass
-    raise ValueError("layers not found")
 
-def main():
-    args = parse_args()
-    device = torch.device(args.device)
-    if device.type == "cuda": torch.cuda.set_device(device)
-    tok = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-    if tok.pad_token is None: tok.pad_token = tok.eos_token
-    full = SFTDataset(args.data_path, args.offset + args.n)
-    texts = full.samples[args.offset:args.offset + args.n]
-    print(f"heldout {len(texts)}", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=torch.bfloat16,
+@app.command()
+def main(
+    model_id: Annotated[str, typer.Option("--model_id")] = "/home/hdd/model/Qwen2.5-7B-Instruct",
+    data_path: Annotated[str, typer.Option("--data_path")] = "./data/sft_t2t_mini.jsonl",
+    offset: Annotated[int, typer.Option("--offset")] = 1000,
+    n: Annotated[int, typer.Option("--n")] = 100,
+    device: Annotated[str, typer.Option("--device")] = "cuda:0",
+    out: Annotated[str, typer.Option("--out")] = "/tmp/layer_probe.json",
+) -> None:
+    """Bypass each dense layer in turn and rank them by held-out damage."""
+    from speaker.terminal import setup_terminal
+    setup_terminal()
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    full = SFTDataset(data_path, offset + n)
+    texts = full.samples[offset:offset + n]
+    logger.info(f"heldout {len(texts)}")
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16,
         device_map=None, trust_remote_code=True, low_cpu_mem_usage=True).to(device)
     layers = find_layers(model)
     N = len(layers)
     coll = make_collate(tok, device, 256)
     base = eval_heldout(model, texts, coll)
-    print(f"baseline loss {base['loss']:.3f} acc {base['acc']:.3f}", flush=True)
+    logger.info(f"baseline loss {base['loss']:.3f} acc {base['acc']:.3f}")
     rows = []
     for i in range(N):
-        def _skip(module, margs, output, _i=i):
-            hs = margs[0] if margs else output[0]
-            return (hs,) + tuple(output[1:]) if isinstance(output, tuple) else hs
-        h = layers[i].register_forward_hook(_skip)
+        h = layers[i].register_forward_hook(passthrough_hook)
         r = eval_heldout(model, texts, coll)
         h.remove()
         rows.append({"layer": i, "loss": r["loss"], "acc": r["acc"],
-                     "dloss": r["loss"]-base["loss"], "dacc": r["acc"]-base["acc"]})
-        print(f"skip L{i:2d}: loss {r['loss']:.3f} (Δ{r['loss']-base['loss']:+.3f}) "
-              f"acc {r['acc']:.3f} (Δ{r['acc']-base['acc']:+.3f})", flush=True)
+                     "dloss": r["loss"] - base["loss"], "dacc": r["acc"] - base["acc"]})
+        logger.info(f"skip L{i:2d}: loss {r['loss']:.3f} (Δ{r['loss'] - base['loss']:+.3f}) "
+                    f"acc {r['acc']:.3f} (Δ{r['acc'] - base['acc']:+.3f})")
     rows.sort(key=lambda r: -r["dloss"])
-    print("rank by importance: " + " ".join(f"L{r['layer']}({r['dloss']:+.2f})" for r in rows[:8]), flush=True)
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump({"baseline": base, "rows": rows}, f, indent=1)
-    print(f"saved {args.out}", flush=True)
+    logger.info("rank by importance: " + " ".join(f"L{r['layer']}({r['dloss']:+.2f})" for r in rows[:8]))
+    dump_json(out, {"baseline": base, "rows": rows})
+    logger.info(f"saved {out}")
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    app()

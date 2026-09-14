@@ -14,6 +14,7 @@ import torch
 
 from speaker import SpeakerConfig, convert_to_speaker
 from speaker.load_profile import estimate_layer_bytes
+from speaker.log import logger
 
 MODEL_ID = "/home/hdd/model/Qwen1.5-0.5B"
 
@@ -37,8 +38,8 @@ def main():
     mod = convert_to_speaker(model, cfg)
     mod.eval()
     mod.set_skip_mode("hard")
-    print(f"base N={cfg.num_hidden_layers} fixed={cfg.always_on_layers} "
-          f"gated={len(cfg.gated_layers)}")
+    logger.info(f"base N={cfg.num_hidden_layers} fixed={cfg.always_on_layers} "
+                f"gated={len(cfg.gated_layers)}")
 
     # tight budget: fixed layers + ~2 gated layers on GPU, the rest scheduled to CPU
     lb = estimate_layer_bytes(mod)
@@ -47,14 +48,14 @@ def main():
     gpu_total = (fixed_b + 2.5 * gated_avg) / 1e9
     sched = mod.schedule_placement("lfu", gpu_total_gb=gpu_total, reserve_gb=0.05,
                                    gpu_device="cuda:0", cpu_device="cpu", seed=0)
-    gpu_layers = sched.resident
+    sched.resident
     dev = {i: layer_device(mod, i) for i in range(cfg.num_hidden_layers)}
     n_cpu = sum(1 for v in dev.values() if v == "cpu")
     assert n_cpu > 0, f"expected a mixed placement, got all on {set(dev.values())}"
     assert all(dev[i] == "cuda" for i in cfg.always_on_layers), "fixed layers must be GPU-resident"
-    print(sched.describe())
-    print(f"placement: gpu {sum(1 for v in dev.values() if v == 'cuda')} / "
-          f"cpu {n_cpu} layers; resident_gb={mod.resident_gb('cuda'):.2f}")
+    logger.info(sched.describe())
+    logger.info(f"placement: gpu {sum(1 for v in dev.values() if v == 'cuda')} / "
+                f"cpu {n_cpu} layers; resident_gb={mod.resident_gb('cuda'):.2f}")
 
     prompt = tok(["Hello world, this is a test of mixed-device generation,"],
                  return_tensors="pt").to("cuda:0")
@@ -64,7 +65,7 @@ def main():
                                pad_token_id=tok.pad_token_id, use_cache=True)
         text = tok.decode(out[0, prompt["input_ids"].shape[1]:])
         assert out.isfinite().all(), "generation produced non-finite token ids"
-        print(f"turn {turn}: {text!r}  (skip_hits={mod.get_skip_hits()})")
+        logger.info(f"turn {turn}: {text!r}  (skip_hits={mod.get_skip_hits()})")
         if turn == 0:
             # between generations: LFU harvest -> re-plan -> move layers if changed
             with torch.no_grad():
@@ -72,10 +73,10 @@ def main():
             before = list(sched.resident)
             sched.reschedule()
             moved = sorted(set(before) ^ set(sched.resident))
-            print(f"reschedule: resident {before} -> {sched.resident} "
-                  f"(changed layers {moved or '-'})")
-    print(f"final devices cpu={sorted(i for i, v in dev.items() if layer_device(mod, i) == 'cpu')}")
-    print("GPU scheduler smoke passed (moe mixed-device generate + reschedule)")
+            logger.info(f"reschedule: resident {before} -> {sched.resident} "
+                        f"(changed layers {moved or '-'})")
+    logger.info(f"final devices cpu={sorted(i for i, v in dev.items() if layer_device(mod, i) == 'cpu')}")
+    logger.info("GPU scheduler smoke passed (moe mixed-device generate + reschedule)")
 
 
 if __name__ == "__main__":
