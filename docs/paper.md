@@ -1,256 +1,217 @@
-# Speaker: Layer-Level Budget-Elastic Gating with Shared Anchors for Efficient LLM Inference
+# Speaker: Post-Training Repair for Layer-Sparse LLM Inference
 
-> **DRAFT** (r7 cycle). Numbers are frozen from completed runs; `[TODO-P2]` marks slots to be
-> filled by the r7 evaluation suite (fresh-slice / 128-token generation / k-distribution) and
-> the pending MoDification scan. Provenance: every number in this draft traces to a dated
-> experiment log (see §7 Provenance).
+> **Status** (v0.2.0). Headline numbers are frozen from converged runs (Qwen2.5-7B,
+> full 904K SFT × 4000 steps, seed 42); older-regime figures are marked as mechanism
+> evidence, not headlines. Attribution convention: **[Paper]** = prior published
+> method we reuse or compare against (cited); **[Ours]** = this project's own
+> mechanism, finding, or negative result. Provenance for every claim: §7.
 
 ## Abstract
 
-Large language models execute every transformer layer for every token, yet layer
-contributions are heavily skewed: a few anchor layers carry most of the computation while
-a large middle band is functionally redundant for most tokens. We present **Speaker**, an
-architecture that (i) pins a small set of **always-on shared anchor layers** (learned from
-runtime load profiles, not hand-picked), (ii) gates the remaining layers per token with a
-**budget-elastic Lagrangian** — the layer price λ adapts online to defend an accuracy
-floor while spending all remaining headroom on sparsity — and (iii) repairs the sparsified
-network by **joint LoRA fine-tuning**, so the gate and the weights co-adapt. On
-Qwen2.5-7B full-data SFT, Speaker is the only method in a five-way comparison (dense-ft,
-MoD, MoDification, Router-Tuning, Speaker) that is simultaneously **sparse** (54% of
-layers executed) and **above the un-finetuned base** (+2.9pt held-out accuracy; +7.7pt at
-the 22k-step operating point with 37.5% layers and −58% weight traffic). We further give a
-failure analysis of why "sparse and accurate" is hard: capacity-pinned routing (MoD) buys
-neither, frozen-base gate-only tuning (RT) self-locks near-dense, regularization-pressure
-tuning (MoDification) is bistable between near-dense and gate-collapse, and our own joint
-top-p routing collapses through a renormalization-induced dilution mechanism — an
-honest negative result with a calibrated-temperature mitigation.
+Large language models execute every transformer layer for every token, yet per-token
+depth demand is skewed and partly redundant. We present **Speaker**, a
+post-training repair recipe that makes a 7B model simultaneously **sparse and above
+its starting point**: per-layer threshold gates (**[Ours]** mechanism, standard
+sigmoid+STE tools **[Paper]**) trained with a **fixed Lagrangian depth price**,
+joint LoRA repair, and rollout-mode unlikelihood on self-generated prefixes
+(**[Ours]** adaptation of Welleck‐style UL **[Paper]**). At k = 16.1/28 active
+layers the repaired model beats raw dense by +4.3pt held-out accuracy while
+per-token weight demand drops 42% (7.51 vs 13.05 GB) and KV demand drops 41%;
+128-token generation holds ROUGE-L at the dense line (0.259 vs 0.252) with
+repetition cut by a third versus the short-rollout variant (seq-rep-4 0.223 vs
+0.340). We also report the honest negatives that shaped the recipe: capacity-pinned
+routing (MoD **[Paper]**) buys neither sparsity nor accuracy; frozen-base gate-only
+tuning (Router-Tuning **[Paper]**) self-locks near-dense; regularization-pressure
+tuning (MoDification **[Paper]**) is bistable between near-dense and gate-collapse;
+and our own joint top-p router collapsed through a renormalization-dilution
+mechanism (**[Ours]** failure analysis) that a top-normalized reweighting breaks
+(+13pt recovery, partial).
 
-## 1 Introduction
+## 1 Motivation
 
-**Layer redundancy is an empirical fact, not an assumption.** Ablating layers one at a
-time on a 24-layer 0.5B model shows a heavily skewed contribution profile (L0 ≫ L1 >
-L23; the middle band is nearly flat). Load profiling at 7B shows the same shape: without
-any prior, the gate spontaneously routes 0.99/0.97 of tokens through the first/last
-layers while the middle band idles at 0.08–0.18. Token-level probes show inference-heavy
-text uses ~2.4 more layers than syntactic text — per-token demand varies.
+**Memory, not FLOPs, is the binding constraint where we deploy.** On a 24 GB edge
+card a 7B bf16 model (13 GB of decoder weights) leaves little room for KV cache at
+long context — yet every token pays full depth. The per-token *demand* (weights
+that must be touched + KV that must be read) is the number a decoding loop actually
+provisions; peak residency and FLOPs are secondary. This is the MoDification
+accounting coordinate **[Paper]**, which we adopt as the single efficiency axis
+(§4.1): same-loss-lower-memory or same-memory-lower-loss, nothing else.
 
-**But sparsity is not free, and "repair" has a price.** A frozen-base model with deleted
-layers loses accuracy that gate-only tuning cannot buy back. We frame this with the
-**repair budget**: an equal-spec LoRA run with all layers on quantifies what joint
-fine-tuning can restore (+16.5pt on our 7B full-data protocol, k=28 endpoint). A sparse
-method's net value is its accuracy *minus* the repair budget at matched k. Under this
-calibration, prior layer-skipping baselines are strictly negative (§4).
+**Repair, not finetuning.** Deleting or skipping layers of a frozen model loses
+accuracy that gate-only tuning cannot buy back (RT evidence, §2.3). We therefore
+frame training as **post-training repair**, the standard move of the pruning
+literature **[Paper: Wanda; SparseGPT]**: sparsity necessarily wounds, training
+closes the wound. The yardstick is an equal-spec dense LoRA run — the *repair
+budget* — and a sparse method's net value is its accuracy minus that budget at
+matched depth. Raw dense is the starting line (the sparsity tax starts there);
+dense-ft is the calibration, not a competitor.
 
-Speaker's position:
-1. **Shared anchors, not a hand-designed skeleton.** Head/tail anchors initialize the
-   always-on set; runtime load profiles promote persistently-hot gated layers into it.
-   The anchors the gate spontaneously chooses replicate the hand-designed prior (L0/L27
-   at 0.99/0.97 without any prior).
-2. **Budget elasticity as a control problem.** The training objective is
-   `LM loss + λ·mean(k)` with a *dual* on λ: when held-out EMA accuracy is above a floor,
-   λ grows and spends the headroom on sparsity; below the floor, λ relaxes and the gates
-   reopen. The floor is set at the *un-finetuned base* level — "be at least as good as
-   the model you started from, then get cheap".
-3. **Joint repair, not gate-only.** LoRA adapters train together with the gate; KL to
-   the dense teacher (optional) and rollout-mode unlikelihood (anti-repetition) complete
-   the recipe.
+**Serving frameworks cannot run this — yet.** Dynamic per-token layer paths
+contradict the three assumptions of vLLM/SGLang-style serving **[Paper:
+PagedAttention]**: CUDA graphs require static execution paths, continuous batching
+requires all requests to want the same layers at the same step, and paged KV
+assumes every layer holds every token's KV. Our contribution is therefore
+training-side repair plus demand accounting, not latency: measured wall-clock
+today shows no win (wrapper overhead ≈ +12% ms/tok, §4.4). The honest path to
+serving is a per-request *static* mask (profile → freeze the active set → run a
+static subgraph) — a separate serving paper, listed in §6, not claimed here.
 
-Contributions:
-- The shared-anchor + budget-elastic gating architecture with an accuracy-floor dual,
-  and its deployment path (hard layer skipping, sparse KV cache, budgeted GPU-residency
-  scheduling with random/lru/lfu policies) (**§3**, docs/gating.md, docs/inference.md).
-- A controlled five-way comparison at 7B full data, 4000 steps, identical LoRA spec,
-  where Speaker is the only sparse-and-above-base method (**§5**).
-- A mechanism-level failure analysis of four alternatives — including our own joint
-  top-p router, whose collapse we trace to renormalization dilution and mitigate with
-  init-time temperature calibration (**§4.4**, §6).
+## 2 Observations (what the data forced on us)
 
-## 2 Related Work
+1. **Layer demand is skewed and self-organizing.** Per-layer ablation (0.5B) shows
+   L0 ≫ L1 > L23 with a flat middle band; with no fixed-layer prior, gates
+   spontaneously route 0.99/0.97 of tokens through the first/last layers while the
+   middle idles at 0.08–0.18 **[Ours]**. Fixing [0,1,26,27] costs almost nothing;
+   the compressible part is the ~12 gated layers of the current k = 16.1 total.
+2. **Price binds, cap doesn't.** Gated selection (≈12) sits well below kmax = 16
+   and k is flat across the whole run — depth is set by the Lagrangian price, not
+   the safety cap **[Ours]**. Lower k is available by raising the price; the
+   acc-vs-k frontier scan is unopened future work.
+3. **Training k undercounts deployment k by ~25%.** Teacher-forced position
+   quartiles over a 1024 window are dead flat ([20.4, 20.2, 20.2, 20.3] hard k,
+   new `--pos_bins` probe **[Ours]**), and hard-probed k (20.3) equals free-decoded
+   k (20.4): there is no position effect and no self-generation drift. The entire
+   train→deploy gap is the **soft→hard gate gap** — deployment accounting must use
+   probed hard k, never logged soft k **[Ours]**.
+4. **Repetition residual is a data artifact, not gate damage.** All finetuned
+   models — including near-dense MoDification (k ≈ 28) — fall into multi-turn
+   self-dialogue loops on chit-chat prompts; raw dense does not **[Ours]**.
+   Human rating (9 samples, 1–5): dense 4 > long_4k 3.5 ≈ mdf 3.5 > short-rollout
+   2.5. The seq-rep-4 gap to dense is this loop, learned from SFT multi-turn
+   format — distillation (KL) points the wrong way at it.
+5. **Baselines fail in the same place for different reasons** (r1–r7 mechanism
+   runs **[Ours]** measurements of **[Paper]** methods): MoD's capacity pins k to
+   an arithmetic constant with winner-take-all bimodality, and its raw-score
+   router is padding-fragile at bs > 1 (itself a deployment defect); RT's budget
+   term is drowned by the LM loss and STE saturates, self-locking exec at
+   0.68–0.72; MoDification is bistable in α (0.01 → exec 0.99 near-dense;
+   1.0 → gates collapse shut; 0.1 lands mid-regime).
+6. **Our own joint router collapsed — mechanism identified.** Renormalized weights
+   (Σw = 1) couple k to effective layer gain: at large k every layer runs at w ≈
+   0.07 and the LM gradient's cheapest fix is concentration (k 14.5 → 4.5 while λ
+   sits at its floor, disconnected) **[Ours]**. Top-normalized reweighting
+   (w = p/p_max) reconnects the dual lever: +13pt accuracy, healthy adaptive k.
+   Unfixed residue: init-time temperature calibration only changes counts, not
+   routing identity.
 
-| | MoD (2024) | MoDification (2025) | Router-Tuning (2025) | **Speaker** |
-|---|---|---|---|---|
-| Decision granularity | per-layer router, top-k capacity | per-layer router, threshold-p | per-layer router | per-layer threshold (mainline) / joint top-p |
-| always-on layers | — | shared gate | — | **yes, profile-promoted** |
-| Sparsity control | constant k via capacity | R = α·ΣFG pressure | relu(cap−target) budget | **elastic λ·k + accuracy-floor dual** |
-| Base model | trained from scratch | 10B word-conversion | **frozen base** | LoRA joint repair |
-| Efficiency target | FLOPs at fixed k | serving cost | token budget | **deployed demand: skipped layers + sparse KV + residency** |
-
-MoD fixes k by capacity and trains from scratch with BCE routing; at 7B with LoRA repair
-its accuracy stays −14 to −22pt below the base at every capacity we scanned. MoDification
-replaces the hard budget with a regularization pressure; its behavior is bistable in α
-(near-dense or gate-collapse; §4.3). Router-Tuning freezes the base and trains gates
-only; on our protocol its exec-rate knob does not move the network (self-locks at
-0.68–0.72 across targets 0.1/0.25/0.5).
-
-## 3 Method
-
-### 3.1 Architecture: shared anchors + gated region
-
-N-layer decoder; a small always-on set `A` (initialized to first/last k layers,
-`|A|=4` on 28-layer Qwen2.5-7B) executes unconditionally; the remaining G = N − |A|
-gated layers execute per token. Gated layer l applies the **weighted residual**
-`h += w_l · (F_l(h) − h)`; w_l = 0 means the layer is skipped entirely (no forward, no
-KV write). The always-on set is not static: `profile_layers` harvests per-layer load and
-promotes gated layers above a load threshold (≥0.9) into `A`, yielding a new ckpt whose
-router is re-initialized for the reduced pool.
-
-### 3.2 Gating (dual scheme, switchable)
-
-- **threshold (mainline, all positive results)**: each gated layer has a linear router
-  `a_l(h) → logit` and a threshold τ_l; `open iff sigmoid((a_l − τ_l)/T_a) ≥ 0.5`, STE
-  backward. τ_l is **calibrated at init** from per-layer stability statistics
-  (StableSkip-style): the network starts near-dense (k₀ ≈ 15/24 gated) and the budget
-  trims it during training.
-- **moe (joint top-p routing)**: one `JointRouter(H→G)` at the gated-region entry emits
-  a distribution over gated layers; top-p prefix selection (k adaptive per token);
-  selected probabilities renormalize into w. See §4.4 for the collapse analysis and
-  §6 for status.
-
-Gating cost is negligible: ~86K parameters on 7B (<0.002%).
-
-### 3.3 Elastic budget with an accuracy-floor dual
+## 3 Design (default recipe = long_4k, validated 0914)
 
 ```
-L = L_LM + λ·mean(k_soft) + aux        aux = z-loss + load-balance + cos-regularizer
-λ ← λ·(1±r)  every eval, after warmup:  EMA_acc < floor → λ shrinks; ≥ floor → λ grows
-λ ∈ [price_min, price_max]  (multiplicative, can climb back from the floor)
+loss = L_LM + λ·mean(k) + UL_rollout(128tok, coef 0.3)
+λ = 0.0005 fixed (dual off) · threshold gates + tau calibration + kmax 16 cap
+base = LoRA r8 α16 q/v joint-trained · full 904K SFT × 4000 steps · bs2 × 1024 · seed 42
 ```
 
-The floor is set at the un-finetuned base's held-out accuracy (0.55 vs measured base
-0.536). This makes the *operating point* a discovery, not a hyperparameter: the run
-settles where the accuracy constraint binds (r5: k 10.5±1.4 = 37.5% of layers with acc
-+7.7pt above base).
+- **Threshold gate [Ours mechanism / Paper tools].** Per-layer linear router +
+  threshold τ, open iff sigmoid((a−τ)/T) ≥ 0.5, STE backward **[Paper: Bengio et
+  al.]**. τ calibrated at init from stability statistics (near-dense start, the
+  budget trims down); kmax is a safety cap, rarely binding (§2.2). Gate cost:
+  ~41K params on 0.5B scale (<0.005%); negligible at 7B.
+- **Fixed Lagrangian price [Ours verdict].** `λ·mean(k)` with λ fixed. The
+  alternatives were built and falsified: an accuracy-floor dual controller
+  (EMA + warmup gate, still in-tree but default-off), hinge/tail budget shapes
+  (hinge parks k but adds no accuracy; tail is dead weight), and
+  difficulty-shaped per-token λ (slope r = 0.046, indistinguishable from
+  unshaped — shaping pressure is homeopathic while λ hugs the floor)
+  **[Ours negatives]**.
+- **Joint LoRA repair [Paper tool / Ours necessity finding].** LoRA **[Paper: Hu
+  et al.]** trains together with the gates; gate-only (frozen base) is falsified twice
+  (own gate-only runs + RT reproduction). kl_coef = 0: distillation arms were cut
+  because kl = 0 already recovers past dense and the remaining gap is format, not
+  distribution (§2.4) **[Ours verdict]**.
+- **Rollout UL [Paper method / Ours adaptation].** N-gram unlikelihood **[Paper:
+  Welleck et al.]** computed on hard self-generated rollouts (DAgger-style
+  **[Paper: Ross et al.]**), not ground truth: GT-UL relaxes depth (+50% k,
+  adaptivity loss σ 1.9 → 1.1); rollout-UL holds k flat at −20% training
+  throughput. Length 128 beats 24 only at convergence (500-step pilot read
+  0.475 vs 0.340 — an undertraining false negative; 4000-step reads 0.223)
+  **[Ours]**; dose scales with length (UL mean 1.75 vs 0.59 at equal coef).
+- **Deployment [Ours].** Hard skip (unselected layers neither execute nor write
+  KV — sparse KV cache, ROUGE parity Δ−0.007 on 0.5B); budgeted GPU-residency
+  scheduler (always-on pinned, gated layers packed under random/lru/lfu, migrate
+  only between generations, KV never moves); per-token demand accounting
+  (weights/KV/FLOP in the MoDification coordinate).
+- **Kept but off by default [Ours].** DualController (accuracy-floor λ),
+  difficulty shaping, hinge/tail budgets, joint top-p router (MoL), KL channel —
+  each with a logged falsification or partial-fix verdict; see docs/training.md
+  and docs/gating.md for the mechanism details.
 
-### 3.4 Joint repair training
+## 4 Experiments
 
-LoRA (r8, q/v) on the base trains jointly with the gate; optional KL distillation to
-the dense teacher; rollout-mode unlikelihood (every 20 steps, 24-token hard rollouts
-from real prefixes, DAgger-style) suppresses repetition without spending sparsity
-(−41% rep3 at unchanged k; the GT-prefix variant instead relaxes the gate, +50% k, and
-loses per-token adaptivity — we use rollout).
+### 4.1 Protocol (frozen)
 
-### 3.5 Deployment
+Qwen2.5-7B-Instruct; full 904K SFT slice [0, 904000) training; formal held-out at
+offset 20000 (n = 300, max_len 1024, bs 1, labels accounting); generation 30
+prompts × 128 tokens greedy from the same slice. Metrics use paper-original names
+only **[Paper]**: ROUGE-L F1 (Lin 2004, via the public rouge-score API with a
+documented Tokenizer-subclass extension for CJK) and seq-rep-4 (Welleck et al.
+2020, Eq. 10). 30-prompt ROUGE is a coarse screen (ranking ≠ human ranking, §2.4).
 
-Hard skip mode: unselected layers do not execute and do not write K/V (sparse KV cache;
-ROUGE parity with full cache, −0.007). Weight traffic (GB moved per token under
-CPU/GPU tiering) drops −58% at the r5 operating point. A **residency scheduler**
-(speaker/scheduler.py) keeps always-on layers on GPU, packs gated layers into the
-remaining budget minus KV/activation reserve under random/lru/lfu policies, harvests
-per-layer token counts, and migrates only between generations (KV cache never moves).
+### 4.2 Main table (converged, hard-mode deployment numbers)
 
-## 4 Why "sparse and accurate" is hard: four failure modes
-
-All numbers: Qwen2.5-7B, full 904K-sample SFT, 4000 steps, identical LoRA spec
-(RT follows its paper's frozen-base recipe), held-out slice [904000, 904300), base
-reference acc 0.536 / loss 2.740.
-
-### 4.1 MoD: capacity pins k, BCE binarizes routing
-Capacity {0.125, 0.25, 0.5} → k pinned at 16.2/18.4/21.0 with σ → 0.5 at the largest
-cap; accuracy 0.318/0.358/0.396 — monotonically better as it approaches dense, never
-crossing the base. Short-run dynamics (0.5B, 500 steps) show the mechanism: init loss
-13.3 with the raw-score router, winner-take-all token routing (76% of tokens collapse
-to k=4), and per-layer execution rates frozen at the capacity value — k is an
-arithmetic constant, not a per-token decision.
-
-### 4.2 Router-Tuning: frozen base, knob ineffective
-Targets {0.1, 0.25, 0.5} all end at exec 0.68–0.72, k ≈ 24/28, acc −1 to −2pt.
-The budget term (~0.3) is drowned by the LM loss and STE saturates; without joint
-repair the gate's only stable strategy is near-dense.
-
-### 4.3 MoDification: bistable in α
-α = 0.01 (paper default) → exec 0.99, k 27.8 (dense, no sparsity tax). α = 1.0 →
-gates collapse **shut** (exec 0.00, k 14.1 = anchors only). α = 0.1 lands in the
-sparse region (k 20.2, exec 0.44) — `[TODO-P2]` its final accuracy decides whether the
-middle regime survives. The pattern mirrors MoD: pressure regimes either pay full
-density or collapse; an elastic floor is what the family lacks.
-
-### 4.4 Our own joint top-p router collapses (honest negative)
-The joint router's renormalized weights (Σw = 1 over selected layers) couple k to
-effective layer gain: at k₀ ≈ 14 every selected layer runs at w ≈ 0.07 of its residual
-— the forward is destroyed, and the LM gradient's cheapest recovery is
-**concentration** (sharpen p so the top layer gets w ≈ 1). Observed at 7B: k falls
-14.5 → 4.5 while λ is already at its floor (the dual cannot push back — the gates it
-would reopen have saturated STE masks); accuracy never takes off (0.22–0.32 final).
-Two aggravators: training-time Gumbel noise inflates effective logit dispersion
-(training k₀ ≈ 4.8 vs eval k₀ = 14.3 at top-p 0.7), and the budget ramp coincides with
-the high-loss phase where LM gradients are least informative. Mitigations implemented:
-init-time router-temperature calibration (flatten-only, bisected to a target starting
-k; bit-for-bit identity when off) and kmax decoupling. The weight-coupling itself is
-open (§6).
-
-## 5 Experiments
-
-### 5.1 Protocol
-Models: Qwen2.5-7B-Instruct (main), Qwen1.5-0.5B (smoke only). Data: 904K-sample SFT
-corpus, len 1024, bs 2, LoRA r8 α16 q/v (RT: paper recipe), 4000 steps, seed 42,
-patience disabled. Held-out: [904000, 904300); fresh: [904300, 904600). Eval at bs 1
-(MoD's raw-score router is padding-fragile at bs > 1 — itself a deployment defect).
-
-### 5.2 Main table (r7, training-time held-out)
-
-| Method | Working point | Acc | Δ vs base | k_total (/28) | Exec rate |
+| Method | held-out loss / acc (Δacc) | k /28 | mem GB / FLOP | ROUGE-L | seq-rep-4 |
 |---|---|---|---|---|---|
-| base (raw) | — | 0.536 | — | 28 | 100% |
-| dense-ft | LoRA, all layers | 0.701 | +16.5 | 28 | 100% |
-| **Speaker-thr** | r5 recipe | **0.565** | **+2.9** | **15.2** | **54%** |
-| MoD | cap 0.125 | 0.318 | −21.8 | 16.2 | 58% |
-| MoD | cap 0.25 | 0.358 | −17.8 | 18.4 | 66% |
-| MoD | cap 0.5 | 0.396 | −14.1 | 21.0 | 75% |
-| MoDification | α 0.01 | `[TODO]` | — | 27.8* | 99%* |
-| MoDification | α 0.1 | `[TODO]` | — | 20.2* | 44%* |
-| MoDification | α 1.0 | `[TODO]` | — | 14.1* | 0%* |
-| RT | target 0.1/0.25/0.5 | 0.517/0.520/0.525 | −1~−2 | 23.5–24.1 | 84–86% |
+| dense (raw) | 2.193 / 0.508 | 28 | 13.05 / 1.00 | 0.252 | 0.073 |
+| ours short-rollout (500-step pilot) | 1.685 / 0.546 (+0.039) | 16.4 | 7.66 / 0.59 | 0.268 | 0.340 |
+| **ours long_4k (default)** | **1.667 / 0.551 (+0.043)** | **16.1** | **7.51 / 0.58** | **0.259** | **0.223** |
+| MoDification (α 0.01) | 1.436 / 0.593 (+0.085) | 27.8 | 12.97 / 0.99 | 0.293 | 0.201 |
 
-\* mid-run readings (step 940–1760); finals pending.
+(Train-slice plain+soft read for long_4k: 1.732/0.619, Δacc +0.083 — loop-control
+scale, not the reporting scale per §4.1.)
 
-**Reading**: measured against the repair budget (dense-ft +16.5pt), every baseline is
-strictly negative at every scanned operating point; Speaker-thr is the only positive
-net effect under real sparsity.
+**Reading.** Same-loss-lower-memory: long_4k matches dense ROUGE-L at −42% weight
+demand. Same-memory-lower-loss: no baseline occupies the k ≈ 16 column except
+ours; MoDification wins accuracy by paying full density (its mirror failure to
+MoD, §2.5). The only red cell is repetition (3× dense), attributed to data format
+(§2.4) with a decode-time lever (ngram ban + penalty → 0.042 ≈ dense) already
+validated as the backstop.
 
-### 5.3 Long-run operating point (r5, 22k steps, same family)
-Held-out Δacc **+7.7pt** (0.614 vs 0.537), k 10.5±1.4 (37.5% layers), weight traffic
-6.4 vs 15.4 GB/token (−58%); generation ROUGE 0.267 vs dense-same-slice 0.168 (+59%),
-rep3 0.390 vs 0.191 (repetition remains the open quality gap; rollout-UL and decode-time
-penalty are partial). Decode-time k drifts above training-time k (7.4 → 11.7; the gate
-opens more layers on its own prefixes) — deployment accounting must use probed k, not
-logged k.
+### 4.3 Ablations (each a verdict, not a sweep)
 
-### 5.4 Per-token adaptivity
-k distribution at the 7B operating point is unimodal bell (μ 11.4, σ 1.9,
-q10–90 = [9,14]) — per-token decisions, not capacity arithmetic (MoD pins a two-point
-distribution at the capacity value; GT-UL narrows σ to 1.1 while inflating μ 37%,
-i.e. adaptivity loss, which is why we use rollout-UL). `[TODO-P2]` r7 k-dist for all
-methods.
+- Rollout length needs convergence to judge (0.475@500 steps → 0.223@4000).
+- Budget shape: mean wins; hinge/tail cut.
+- Difficulty shaping: slope 0.046, cut.
+- MoL reweighting: pmax over renorm +13pt, collapse broken, recovery partial.
+- k accounting: soft log 16.4 vs deploy hard 20.3 — report hard only.
 
-### 5.5 Efficiency
-FLOP accounting: k ≈ 12/28 ≈ 2.4× nominal compute saving at the r4 operating point;
-wall-clock parity today (wrapper overhead dominates; kernel-level ragged execution is
-future work). Sparse KV: skipping a layer writes no cache (parity ROUGE, −0.007).
-Residency scheduling: budgeted packing with harvested counts, migration only between
-generations.
+### 4.4 Honest costs
 
-### 5.6 Generation (r7) — `[TODO-P2]`
-30 prompts × 128 tokens, greedy, fresh slice: ROUGE / rep3 / latency per method.
+Training throughput −25% (rollout-128); inference wall-clock no win (+12% ms/tok
+wrapper overhead — FLOP savings need kernel/ragged execution); 30-prompt
+generation metrics are noisy screens next to human reads.
 
-## 6 Limitations & open problems
-1. **Wall-clock**: layer skipping saves FLOPs and weight traffic, not yet latency
-   (Python wrapper overhead; ragged batched execution needed).
-2. **Repetition** under free generation: rollout-UL halves it; the residual gap to
-   dense remains the main quality issue.
-3. **Joint top-p routing** (moe): renormalization-induced dilution is identified but
-   unfixed; candidate is top-normalized weights (w = p/p_max) which restores dense-like
-   forward at large k and sharp single-layer execution at small k.
-4. Decode-time k drift (gate opens more layers on self-generated prefixes).
-5. Results are SFT-continuation-centric (repair framing); from-scratch and long-context
-   serving regimes are untested here.
+## 5 Related work (one-paragraph placements)
 
-## 7 Provenance (claim → experiment)
-- Layer skew / anchor self-selection: per-layer ablation probe (0.5B); load profiles r5/r6.
-- Dual-price dynamics, MoD/RT failure dynamics: r1 attribution logs + k-distribution probes.
-- mdf bistability: r2 (0.5B) + r7 mid-run readings.
-- Repair budget: r3 (dense-ft 0.724 @500-step small-data) and r7 (0.701 @full-data).
-- Long operating point: r5 (ours_7b_full).
-- UL variants: r4 (gt vs rollout).
-- Sparse KV / offload / scheduling: KV-lite→sparse-cache series, offload run, ed5 scheduler
-  smoke (GPU cross-device).
-- moe collapse + calibration: r7 first-generation runs vs calibrated reruns (both archived).
+- **MoD [Paper]** — token-choice top-k capacity + BCE, from-scratch; k is
+  arithmetic, routing is bimodal, scores are padding-fragile.
+- **MoDification [Paper]** — threshold-p + shared gate + R = αΣFG pressure, 10B-word
+  conversion, long-context serving; accuracy wins by staying dense.
+- **Router-Tuning [Paper]** — frozen base, sigmoid+STE, relu(cap−target); the knob
+  doesn't move.
+- **Pruning repair [Paper: Wanda; SparseGPT]** — our framing source: wound then
+  close it; dense-ft as repair-budget calibration is borrowed logic.
+- **Repetition control [Paper: Welleck UL; DAgger rollouts]** — our UL-on-rollouts
+  is the composition.
+- **Serving [Paper: PagedAttention/vLLM; FlexGen]** — latency–throughput curves are
+  the missing measurement; our demand accounting is the static prerequisite.
+
+## 6 Limitations & future work
+
+1. Wall-clock parity (needs ragged kernels). 2. Repetition residual 3× dense
+   (data-format fix: single-turn truncation, cheap, unopened). 3. acc-vs-k price
+   scan unopened (knob confirmed, frontier unknown). 4. Serving path: per-request
+   static mask → static subgraph (separate paper). 5. Cut, not forgotten: KL
+   ratio/direction/on-policy/data arms, hidden-MSE diagnostics, TTFT/TPOT matrix
+   (AGENTS.md r8-cut row).
+
+## 7 Provenance (claim → artifact)
+
+- Skew / self-selection: 0.5B ablation probe; r5/r6 load profiles.
+- Baseline failures: r1 dynamics + k-dist probes; r3/r7 five-way tables.
+- UL dose / length: r4 + r8c rollout-24-vs-128 + 500-step-vs-4000-step.
+- Soft-hard / position: `--pos_bins` probe (flat quartiles; hard ≈ decode).
+- Dialogue-loop attribution: 9-sample human read of r8c_4k_gen.json.
+- MoL collapse + pmax: ed7/0910-0911 runs; cal-arm variance verdict.
+- Falsified options: budget_form (T-scan 7 arms), difficulty slope, GT-UL
+  adaptivity loss — all archived with logs, none in the default path.
+- Checkpoints: `r8c_{free,long_4k,mdf}` (formal table inputs).

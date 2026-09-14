@@ -1,6 +1,6 @@
 [project]
 name = "speaker"
-version = "0.2.0"
+version = "0.2.1"
 description = "Speaker: fixed (shared) layers + gated layers for edge-side efficient LLM inference (per-token layer skipping, sparse KV cache, GPU/CPU residency scheduling)"
 readme = "README.md"
 requires-python = ">=3.10"
