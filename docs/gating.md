@@ -7,6 +7,11 @@ enters the loss*. Checkpoints of one mode do not load in the other (`gate.pt` ke
 sets are disjoint); `mod_config.json` records the mode, and a missing `gate_mode`
 field (old checkpoints) is inferred as `threshold`.
 
+The **validated default recipe (v0.2.0) trains the `threshold` scheme** — it is the
+finetune CLI default. `moe` remains the `SpeakerConfig` library default and a fully
+supported alternative (pmax-weighted), but it sits off the mainline after the
+renorm-collapse diagnosis (see "Weighted residual" below).
+
 **Scheme names (and CLI aliases)**:
 
 | Scheme | Canonical `gate_mode` | CLI alias | Decides |
@@ -19,7 +24,7 @@ so checkpoints stay bit-compatible with the historical `threshold`/`moe` formats
 
 ---
 
-## moe — joint routing over layers (default mainline)
+## moe — joint routing over layers (library default, off the validated mainline)
 
 One decision per token, made **once**, before the gated region is walked.
 
@@ -119,10 +124,11 @@ router over the remaining gated layers.
 
 ---
 
-## threshold — legacy per-layer gate
+## threshold — per-layer gate (validated mainline)
 
-The original scheme, kept verbatim for old checkpoints and for `calibrate_tau`
-diagnostics. Each gated layer owns an independent binary decision:
+The original scheme, and since r8c/v0.2.0 the validated default recipe (also the
+finetune CLI default); old checkpoints load unchanged, and `calibrate_tau`
+diagnostics live here. Each gated layer owns an independent binary decision:
 
 ```
 logit = Router_l(h)                    per-layer linear map H→1
@@ -174,7 +180,7 @@ them). Two backbone-specific rules:
 
 | Key | Mode | Meaning |
 |---|---|---|
-| `gate_mode` | both | `"moe"` (default) / `"threshold"` |
+| `gate_mode` | both | `"moe"` (library default) / `"threshold"` (finetune default & validated mainline) |
 | `top_p` | moe | cumulative-probability cut (default 0.9) |
 | `kmax` | both | hard cap on per-token k |
 | `gumbel_scale` | threshold | Gumbel noise scale while training the gate |

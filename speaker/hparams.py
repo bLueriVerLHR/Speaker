@@ -21,6 +21,7 @@ class FinetuneConfig:
     dtype: Literal["float32", "bfloat16", "float16"] = "bfloat16"
     batch_size: int = 2
     max_length: int = 1024
+    single_turn: bool = False
     anneal_steps: int = 4000
     max_steps: int = 4000
     lr: float = 2e-5
@@ -34,8 +35,8 @@ class FinetuneConfig:
     top_k: int = 6
     weight_mode: Literal["pmax", "renorm"] = "pmax"
     min_layers: int = 1
-    always_head: int = 2
-    always_tail: int = 2
+    always_head: int = 0
+    always_tail: int = 0
     always_layers: str = ""
     temp_affinity: float = 1.0
     ta_end: float = 0.3
@@ -47,8 +48,9 @@ class FinetuneConfig:
     acc_margin: float = 0.03
     price_warmup: int = 200
     budget_ramp: int = 400
-    budget_form: Literal["mean", "hinge", "tail"] = "mean"
+    budget_form: Literal["mean", "hinge", "tail", "sqdev"] = "mean"
     budget_target: float = 0.0
+    over_budget_coef: float = 0.0
     tail_coef: float = 1.0
     tail_temp: float = 0.5
     diff_mode: Literal["off", "teacher"] = "off"

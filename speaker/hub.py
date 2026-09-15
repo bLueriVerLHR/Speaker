@@ -34,14 +34,19 @@ def _to_common(ts, dim=0):
 
 
 def _budget_core(kk, cfg, price):
-    """Shared elastic core over valid-token k (1D, differentiable). All forms keep
-    ∂L/∂k ≥ 0 so the dual lever (adapt_price) stays connected:
-    - mean (legacy): price·mean(k);
+    """Shared elastic core over valid-token k (1D, differentiable).
+    - mean (legacy): price·mean(k) — one-way downward pressure, needs λ above the
+      LM's marginal depth value to bite (r10: flat over 200× λ on 7B SFT);
     - hinge: price·max(0, mean−T), T = setpoint (parks mean at T; dual tightening
       while parked below T is a no-op, so λ may ratchet to price_max — harmless,
       wall just gets steeper);
     - tail: price·mean + price·tail_coef·P(k>B) with a sigmoid soft counter
-      (SLO-style: mean pressure plus tail-violation pressure).
+      (SLO-style: mean pressure plus tail-violation pressure);
+    - sqdev: price·mean((k−T)²) — penalty on the squared distance from the target T,
+      applied on both sides (closes layers when k is above T, reopens them when k is
+      below T). The pressure grows with the distance (2·λ·|k−T|), so even a small λ
+      pulls hard far away from T. T counts every layer that computes for a token
+      (the caller adds the always-on layers to the gated sum).
     T/B resolve to kmax when budget_target=0 (auto). Deliberately NOT 1/var-style
     shapes: batch var rewards polarized (bimodal) collapse and disconnects the
     dual (r8 ablation note)."""
@@ -54,6 +59,8 @@ def _budget_core(kk, cfg, price):
     if form == "tail":
         frac = torch.sigmoid((kk - T) / max(float(cfg.tail_temp), 1e-3))
         return price * (kk.mean() + float(cfg.tail_coef) * frac.mean())
+    if form == "sqdev":
+        return price * (kk - T).pow(2).mean()
     raise ValueError(f"budget_form must be mean|hinge|tail, got {form!r}")
 
 
@@ -265,6 +272,16 @@ class SpeakerModelWrapper(nn.Module):
         m = hard_m if hard else soft
         return m.sum(-1) if m is not None else None
 
+    def get_total_counts(self, hard: bool = True):
+        """Per-token TOTAL active layers [B,T] = gated selection + always-on (r10 unified
+        K accounting: K = layers computing per token, direct per-token memory demand).
+        This is the only k consumers should report; get_active_counts stays gated-only
+        as the router diagnostic."""
+        c = self.get_active_counts(hard)
+        if c is None:
+            return None
+        return c + len(self.mod_config.always_on_layers)
+
     def get_soft_counts(self):
         return self.get_active_counts(hard=False)
 
@@ -295,6 +312,9 @@ class SpeakerModelWrapper(nn.Module):
         if ste is None:
             return None
         k = ste.sum(-1)  # [B,T] differentiable (via STE)
+        if cfg.budget_form == "sqdev":
+            # T counts every layer that computes for a token, so add always-on here
+            k = k + len(cfg.always_on_layers)
         valid = attention_mask.bool() if attention_mask is not None \
             else torch.ones_like(k, dtype=torch.bool)
         loss = 0

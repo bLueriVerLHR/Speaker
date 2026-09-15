@@ -8,7 +8,7 @@
 #                            # Qwen1.5-0.5B weights + the SFT data path from AGENTS.md)
 #
 # The GPU training smokes (finetune/pretrain 8-step runs) stay outside this gate —
-# they belong to the neu-sbox submission flow (see AGENTS.md).
+# they belong to the job-submission flow (see AGENTS.md).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,7 +40,8 @@ OFFLINE="tests/test_speaker.py tests/test_load_profile.py tests/test_baseline_mo
 tests/test_baseline_mdf.py tests/test_scheduler.py tests/test_ul.py \
 tests/test_ruler_dual.py tests/test_assemble.py tests/test_registry.py \
 tests/test_tooling.py tests/test_budget_form.py tests/test_hybrid_compat.py \
-tests/test_logging.py tests/test_mem_demand.py tests/test_gen_metrics.py"
+tests/test_logging.py tests/test_mem_demand.py tests/test_gen_metrics.py \
+tests/test_sft_single_turn.py tests/test_r10_accounting.py"
 # --fast: core seams only (iteration inner loop; baselines/hybrid stay in the full gate)
 FAST="tests/test_speaker.py tests/test_ruler_dual.py tests/test_ul.py \
 tests/test_assemble.py tests/test_registry.py tests/test_tooling.py \

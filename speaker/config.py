@@ -83,7 +83,7 @@ class SpeakerConfig:
     router_hidden_dim: Optional[int] = None  # None = single linear; set an int for H->int->1
     tau_init: float = 0.0          # initial threshold logit; negative = dense start (gates fully open first, then sparsify)
     use_ste: bool = True           # forward uses hard counts, backward goes through soft
-    over_budget_coef: float = 0.05  # penalty for exceeding kmax (threshold safety cap)
+    over_budget_coef: float = 0.0  # r10: kmax out of the loss (0 = off); legacy 0.05 ckpts resume with their recorded value
     # ---- Temperature + randomness (shared; moe = softmax temperature, threshold = sigmoid temperature) ----
     temp_affinity: float = 1.0     # Ta, annealed down to ~0.3 to harden
     gumbel_scale: float = 1.0      # training noise strength, disabled automatically at eval
@@ -141,8 +141,10 @@ class SpeakerConfig:
             raise ValueError(f"gate_mode must be one of {GATE_MODES}, got {self.gate_mode!r}")
         if self.sparsity_price < 0:
             raise ValueError(f"sparsity_price must be >= 0, got {self.sparsity_price}")
-        if self.budget_form not in ("mean", "hinge", "tail"):
-            raise ValueError(f"budget_form must be mean|hinge|tail, got {self.budget_form!r}")
+        if self.budget_form not in ("mean", "hinge", "tail", "sqdev"):
+            raise ValueError(f"budget_form must be mean|hinge|tail|sqdev, got {self.budget_form!r}")
+        if self.budget_form == "sqdev" and self.budget_target <= 0:
+            raise ValueError("sqdev needs an explicit budget_target (total-K setpoint; no auto)")
         if self.budget_target < 0:
             raise ValueError(f"budget_target must be >= 0, got {self.budget_target}")
         if self.tail_coef < 0:
@@ -248,3 +250,22 @@ class SpeakerConfig:
                 f"Ta={self.temp_affinity} price={self.sparsity_price}(adapt={self.price_adapt}) "
                 f"acc_target={self.acc_target}"
                 f"{' decode=' + str(self.decode) if self.decode else ''})")
+
+
+def budget_pin_warnings(cfg: SpeakerConfig) -> list[str]:
+    """Training-time guard (0916, knee incident): depth k has no binding constraint.
+
+    In threshold mode kmax is not enforced during selection — the only loss-side
+    cap is over_budget_coef (quadratic, one-sided, on gated-k). With budget_form=mean
+    and over_budget_coef=0, k is priced solely by lambda*mean(k), which the LM
+    gradient overwhelms: from the near-dense start k drifts to ~N (measured: the
+    r10 knee control run parked at 27/28)."""
+    if cfg.gate_mode != "threshold":
+        return []
+    if cfg.budget_form == "mean" and cfg.over_budget_coef <= 0:
+        return ["budget_form=mean with over_budget_coef=0: k is only priced by "
+                "lambda*mean(k) and drifts near-dense (r10 knee control: k 27/28); "
+                "in threshold mode kmax alone does not constrain k. Pin depth with "
+                "--over_budget_coef>0 (r8c recipe: 0.05) or a setpoint form "
+                "(hinge/sqdev) with --budget_target."]
+    return []

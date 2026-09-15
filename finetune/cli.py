@@ -5,7 +5,7 @@ signature: each parameter is a single
 ``Annotated[type, typer.Option("--flag_name", help=...)]`` line, defaults and
 ``Literal`` choices inline, ``--help`` rendered by Typer. Flag names keep the
 historical underscore style (``--use_lora`` not ``--use-lora``) and bool
-switches keep their ``--x/--no-x`` dual form, so existing neu-sbox submit
+switches keep their ``--x/--no-x`` dual form, so existing job-queue submit
 lines work unchanged.
 
 ``train()`` packs its flags into a ``speaker.hparams.FinetuneConfig`` (explicit
@@ -34,7 +34,7 @@ def train(
     max_steps: Annotated[int, typer.Option("--max_steps", help="hard step cap; actual stopping is the StopOnPlateau rule")] = 4000,
     lr: Annotated[float, typer.Option("--lr", help="base learning rate")] = 2e-5,
     router_lr: Annotated[float, typer.Option("--router_lr", help="gating-parameter learning rate")] = 1e-4,
-    kmax: Annotated[int, typer.Option("--kmax", help="moe: hard cap during selection; threshold: safety cap")] = 16,
+    kmax: Annotated[int, typer.Option("--kmax", help="moe: hard cap during selection; threshold: NOT enforced in selection — binds only via --over_budget_coef>0 (loss-side cap)")] = 16,
     decode_rep_penalty: Annotated[Optional[float], typer.Option("--decode_rep_penalty", help="bake repetition_penalty into mod_config.json; None = legacy (validated 1.15)")] = None,
     decode_no_repeat_ngram: Annotated[Optional[int], typer.Option("--decode_no_repeat_ngram", help="bake no_repeat_ngram_size into mod_config.json; None = legacy (validated 3)")] = None,
     gate_mode: Annotated[Literal["moe", "mol", "threshold", "speaker"], typer.Option("--gate_mode", help="threshold = per-layer gating (default) / moe = joint routing; ckpt takes precedence on resume")] = "threshold",
@@ -43,8 +43,8 @@ def train(
     top_k: Annotated[int, typer.Option("--top_k", help="moe topk fixed k")] = 6,
     weight_mode: Annotated[Literal["pmax", "renorm"], typer.Option("--weight_mode", help="moe residual weighting: pmax (default, dual lever connected) / renorm (legacy, collapses)")] = "pmax",
     min_layers: Annotated[int, typer.Option("--min_layers", help="moe: minimum gated layers activated per token")] = 1,
-    always_head: Annotated[int, typer.Option("--always_head", help="first m layers fixed (shared)")] = 2,
-    always_tail: Annotated[int, typer.Option("--always_tail", help="last n layers fixed (shared)")] = 2,
+    always_head: Annotated[int, typer.Option("--always_head", help="first m layers fixed (always on); finetune default 0 = every layer gated during training, use --always_layers to pin fixed layers for deployment runs")] = 0,
+    always_tail: Annotated[int, typer.Option("--always_tail", help="last n layers fixed (always on); finetune default 0 = every layer gated during training")] = 0,
     always_layers: Annotated[str, typer.Option("--always_layers", help="explicit fixed-layer list (comma-separated), overrides head/tail; e.g. '0,1,2,22,23'")] = "",
     temp_affinity: Annotated[float, typer.Option("--temp_affinity", help="initial gating temperature Ta")] = 1.0,
     ta_end: Annotated[float, typer.Option("--ta_end", help="annealed Ta end value")] = 0.3,
@@ -56,8 +56,9 @@ def train(
     acc_margin: Annotated[float, typer.Option("--acc_margin", help="auto policy: allowed drop below the dense reference")] = 0.03,
     price_warmup: Annotated[int, typer.Option("--price_warmup", help="lambda frozen for the first N steps")] = 200,
     budget_ramp: Annotated[int, typer.Option("--budget_ramp", help="budget-loss ramp steps (task*=min(1,step/ramp))")] = 400,
-    budget_form: Annotated[Literal["mean", "hinge", "tail"], typer.Option("--budget_form", help="budget shape: mean (legacy) | hinge (park mean at setpoint) | tail (mean + SLO tail pressure)")] = "mean",
-    budget_target: Annotated[float, typer.Option("--budget_target", help="hinge setpoint T / tail budget B; 0 = auto -> kmax")] = 0.0,
+    budget_form: Annotated[Literal["mean", "hinge", "tail", "sqdev"], typer.Option("--budget_form", help="budget shape: mean (legacy λ·mean) | hinge | tail | sqdev (two-sided push toward target T; acts on TOTAL k incl. fixed layers; converges to T+2.5~8)")] = "mean",
+    budget_target: Annotated[float, typer.Option("--budget_target", help="hinge setpoint T / tail budget B / sqdev target; 0 = auto -> kmax")] = 0.0,
+    over_budget_coef: Annotated[float, typer.Option("--over_budget_coef", help="quadratic one-sided pin coef*mean(max(k_gated-kmax,0)^2); 0.05 = r8c recipe depth pin (threshold mode: the only kmax enforcement); 0 = k only λ-priced, drifts near-dense")] = 0.0,
     tail_coef: Annotated[float, typer.Option("--tail_coef", help="tail-violation weight relative to the mean term")] = 1.0,
     tail_temp: Annotated[float, typer.Option("--tail_temp", help="sigmoid softness for the P(k>B) counter")] = 0.5,
     diff_mode: Annotated[Literal["off", "teacher"], typer.Option("--diff_mode", help="difficulty-conditioned budget: teacher = per-token lambda shaping; off = uniform")] = "off",
@@ -76,6 +77,7 @@ def train(
     lora_targets: Annotated[str, typer.Option("--lora_targets", help="LoRA target modules (comma-separated)")] = "q_proj,v_proj",
     gradient_checkpointing: Annotated[bool, typer.Option("--gradient_checkpointing/--no-gradient_checkpointing", help="gradient checkpointing (required for long seq/large batch)")] = True,
     use_chat_template: Annotated[bool, typer.Option("--use_chat_template/--no-use_chat_template", help="chat_template assembly (required for Instruct models)")] = False,
+    single_turn: Annotated[bool, typer.Option("--single_turn/--no-single_turn", help="first-round truncation: keep only the first user+assistant round per sample (default off, P1 red-cell experiment)")] = False,
     mask_user_tokens: Annotated[bool, typer.Option("--mask_user_tokens/--no-mask_user_tokens", help="in chat mode, loss/acc only on assistant replies")] = True,
     kl_coef: Annotated[float, typer.Option("--kl_coef", help="dense self-distillation weight, 0 = off")] = 0.0,
     kl_temp: Annotated[float, typer.Option("--kl_temp", help="distillation temperature")] = 1.0,
@@ -105,7 +107,8 @@ def train(
     run_finetune(FinetuneConfig(
         model_id=model_id, data_path=data_path, device=device,
         device_map=device_map, dtype=dtype, batch_size=batch_size,
-        max_length=max_length, anneal_steps=anneal_steps, max_steps=max_steps,
+        max_length=max_length, single_turn=single_turn,
+        anneal_steps=anneal_steps, max_steps=max_steps,
         lr=lr, router_lr=router_lr, kmax=kmax,
         decode_rep_penalty=decode_rep_penalty,
         decode_no_repeat_ngram=decode_no_repeat_ngram, gate_mode=gate_mode,
@@ -118,6 +121,7 @@ def train(
         acc_target=acc_target, acc_margin=acc_margin,
         price_warmup=price_warmup, budget_ramp=budget_ramp,
         budget_form=budget_form, budget_target=budget_target,
+        over_budget_coef=over_budget_coef,
         tail_coef=tail_coef, tail_temp=tail_temp, diff_mode=diff_mode,
         diff_easy_nll=diff_easy_nll, diff_hard_nll=diff_hard_nll,
         diff_easy_mult=diff_easy_mult, diff_hard_mult=diff_hard_mult,

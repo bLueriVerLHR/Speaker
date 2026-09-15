@@ -39,30 +39,36 @@ frozen base, with a budget `relu(cap − target)` term. EMNLP'25.
 | | MoD | MoDification | Router-Tuning | **Speaker** |
 |---|---|---|---|---|
 | routing unit | tokens per layer | tokens per layer | tokens per layer | **layers per token** |
-| decision count | G decisions/token | G decisions/token | G decisions/token | **1 joint decision/token** |
-| k semantics | constant, fixed a priori | free count, p pinned 0.5 | free, budget-pushed | **top-p, per-token adaptive, dual-trained** |
+| decision count | G decisions/token | G decisions/token | G decisions/token | **per-layer binary gates (threshold mainline) / 1 joint decision (moe)** |
+| k semantics | constant, fixed a priori | free count, p pinned 0.5 | free, budget-pushed | **free per-token count, λ-priced + kmax cap (threshold mainline) / top-p (moe)** |
 | always-on layers | none | none (interleaved) | none | **shared layers promoted by measured load** |
 | base model | from scratch | ~10B-token conversion | frozen base | **LoRA joint finetune (router learns with the model)** |
 | efficiency locus | training FLOPs | serving latency/memory | FLOPs | **edge VRAM: residency + sparse KV + scheduling** |
 
 Three structural claims:
 
-1. **One joint decision per token** (a single router at the gated-region entry)
-   lets k adapt per token under a *budget dual* — the loss directly trades mean
-   depth against an accuracy target. Per-layer independent gates diffuse this
-   pressure (our MoDification reproduction: the R objective was drowned by the
-   LM gradient and the model drifted to near-dense, k 23.9/24; MoD's capacity
-   pinned k at the arithmetic value with zero adaptivity).
+1. **Layers-per-token routing with a priced budget** — per-layer threshold gates (the
+   validated mainline) or the joint top-p router (`moe`) both let k adapt per token
+   while the depth price `λ·mean(k)` trades mean depth against accuracy. MoD-lineage
+   per-layer *token* routing fixes the saving per layer a priori (our reproductions:
+   MoDification's R objective was drowned by the LM gradient and the model drifted to
+   near-dense, k 23.9/24; MoD's capacity pinned k at the arithmetic value with zero
+   adaptivity).
 2. **Shared layers selected by measured load** — not by position and not
    interleaved — concentrate per-token demand: the fixed spine plus few hot
    gated layers cover most activations. This is what makes a *small resident
    set* meaningful on edge hardware; MoD-lineage methods keep every layer live.
-3. **Sparsity with accuracy recovered**: KL self-distillation from the frozen
-   dense teacher + the dual budget + unlikelihood anti-repetition let the
-   sparse model match or exceed dense finetuning accuracy at a fraction of the
-   active depth.
+3. **Sparsity with accuracy recovered**: joint LoRA repair + the fixed depth price +
+   rollout unlikelihood let the sparse model exceed dense at a fraction of the active
+   depth (+4.3pt held-out at k = 16.1/28, frozen headline); KL self-distillation and
+   the accuracy-floor dual stay in-tree as optional arms, cut from the default after
+   falsification runs (docs/paper.md §3).
 
 ## Experimental evidence (same-slice, identical protocol)
+
+Runs r1–r5 below are earlier-regime (500-step pilots / 22K-step full run) **mechanism
+evidence**; frozen converged headlines (Qwen2.5-7B, full 904K × 4000 steps) live in
+[docs/paper.md](paper.md) §4.2.
 
 | run | setup | dense | Speaker | MoD | MoDification | RT |
 |---|---|---|---|---|---|---|

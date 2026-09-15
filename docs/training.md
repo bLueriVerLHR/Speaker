@@ -99,8 +99,10 @@ finetune.
 ## KL self-distillation
 
 The frozen dense model is the teacher (`--kl_coef`, β): the sparse student matches
-its logits while paying the depth price. This is the single biggest accuracy lever
-(full-finetune run: held-out acc **above** dense, +7.7pt at k=10.5/28 layers).
+its logits while paying the depth price. Historical lever (full-finetune run: held-out
+acc above dense, +7.7pt at k=10.5/28 layers), but **cut from the validated default**
+(kl_coef = 0): without it the recipe already recovers past dense, and the remaining
+gap is data format, not distribution (docs/paper.md §2.4/§3).
 
 ## Unlikelihood vs repetition (default on)
 
@@ -194,5 +196,5 @@ Every training run writes, into the checkpoint directory:
 
 Separation rule: records emitted via `emit(key, ...)` go only to their JSONL
 sink; `logger.info/warning/exception` go to console + `run.log`. Console output
-is still streamed (visible in `neu-sbox result`), but persistence is the
+is still streamed (visible in the job runner status), but persistence is the
 logger's job — the submit template carries no `tee`.

@@ -18,9 +18,29 @@ from speaker.log import logger
 CHAT_ROLES = ("system", "user", "assistant")
 
 
-def _text_of(obj: dict, tok=None, use_chat: bool = False) -> str:
+def first_turn(obj: dict) -> dict:
+    """First-round truncation: keep everything up to and including the FIRST
+    assistant reply (system/user preambles preserved); samples without any
+    assistant turn are returned unchanged. Opt-in via --single_turn (default off:
+    history comparability)."""
+    conv = obj.get("conversations")
+    if not isinstance(conv, list):
+        return obj
+    cut = next((i for i, m in enumerate(conv)
+                if isinstance(m, dict) and m.get("role") == "assistant"), None)
+    if cut is None:
+        return obj
+    out = dict(obj)
+    out["conversations"] = conv[:cut + 1]
+    return out
+
+
+def _text_of(obj: dict, tok=None, use_chat: bool = False,
+             single_turn: bool = False) -> str:
     """One jsonl record -> training text (shared by SFTDataset / SFTStreamDataset;
     filtering ``len >= 10`` is applied by the caller, identical to history)."""
+    if single_turn:
+        obj = first_turn(obj)
     if use_chat:
         text = format_sft_text(obj, tok)
     elif "conversations" in obj:
@@ -124,7 +144,8 @@ def mask_non_assistant(input_ids: torch.Tensor, tok) -> torch.Tensor:
 class SFTDataset(Dataset):
     """jsonl -> plain text list. Tokenization/truncation is done per batch in collate."""
 
-    def __init__(self, path, max_samples=0, tok=None, use_chat=False):
+    def __init__(self, path, max_samples=0, tok=None, use_chat=False,
+                 single_turn=False):
         self.samples = []
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -137,10 +158,11 @@ class SFTDataset(Dataset):
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                text = _text_of(obj, tok, use_chat)
+                text = _text_of(obj, tok, use_chat, single_turn)
                 if len(text) >= 10:
                     self.samples.append(text)
-        logger.info(f"Loaded {len(self.samples)} samples")
+        logger.info(f"Loaded {len(self.samples)} samples"
+                    + (" (single_turn)" if single_turn else ""))
 
     def __len__(self):
         return len(self.samples)
@@ -149,7 +171,8 @@ class SFTDataset(Dataset):
         return self.samples[idx]
 
 
-def iter_sft_texts(path, max_samples=0, tok=None, use_chat=False):
+def iter_sft_texts(path, max_samples=0, tok=None, use_chat=False,
+                   single_turn=False):
     """Streaming generator: same parsing/filtering as SFTDataset, no full load.
     For full-data training (904k samples) where holding all texts is wasteful."""
     n = 0
@@ -164,7 +187,7 @@ def iter_sft_texts(path, max_samples=0, tok=None, use_chat=False):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            text = _text_of(obj, tok, use_chat)
+            text = _text_of(obj, tok, use_chat, single_turn)
             if len(text) >= 10:
                 n += 1
                 yield text
@@ -173,14 +196,17 @@ def iter_sft_texts(path, max_samples=0, tok=None, use_chat=False):
 class SFTStreamDataset(IterableDataset):
     """Iterable SFT dataset over iter_sft_texts (full-epoch streaming)."""
 
-    def __init__(self, path, max_samples=0, tok=None, use_chat=False):
+    def __init__(self, path, max_samples=0, tok=None, use_chat=False,
+                 single_turn=False):
         self.path = path
         self.max_samples = max_samples
         self.tok = tok
         self.use_chat = use_chat
+        self.single_turn = single_turn
 
     def __iter__(self):
-        return iter_sft_texts(self.path, self.max_samples, self.tok, self.use_chat)
+        return iter_sft_texts(self.path, self.max_samples, self.tok,
+                              self.use_chat, self.single_turn)
 
 
 def collate(batch, tok, device, max_len):

@@ -12,12 +12,13 @@ Two gating schemes, one switch (`--gate_mode`), one shared fixed/gated layer des
 | **MoL** (Mixture of Layers) | `mol` (canonical `moe`) | one joint router at the gated-region entry picks the layer subset, MoE-style |
 
 Both target **edge-side memory demand**: a smaller GPU footprint (selective weights
-residency + sparse KV cache, −46% per-token demand at 7B), a **schedulable** layer set
-driven by the router's own activation statistics, and accuracy recovered via a unified
-**post-training repair** pipeline (profile a few rounds → promote hot layers to fixed →
-continue finetuning shared + gated layers, with KL self-distillation, rollout
-unlikelihood against repetition, and a dual budget). The roadmap: repair on traditional
-self-attention first, then adapt to linear-attention backbones.
+residency + sparse KV cache; the validated 7B recipe runs k = 16.1/28 layers for
+−42% weight demand and −41% KV demand), a **schedulable** layer set driven by the
+router's own activation statistics, and accuracy recovered via a unified
+**post-training repair** pipeline (joint LoRA repair + a fixed depth price + rollout
+unlikelihood against repetition; KL self-distillation and the accuracy-floor dual stay
+in-tree as optional arms, **off in the validated default**). The roadmap: repair on
+traditional self-attention first, then adapt to linear-attention backbones.
 
 ## 1. Core Idea
 
@@ -63,11 +64,14 @@ The next token gets a different subset — same weights, different depth.
 Training turns two knobs on this picture:
 
 ```
-      loss  = LM + λ·mean(k) + β·KL(sparse ‖ frozen dense)  (+ aux regularizers)
+      loss  = LM + λ·mean(k) + UL_rollout(128 tok, coef 0.3)   ← validated default (v0.2.0)
+                λ = 0.0005 fixed · threshold gates + τ calibration · kmax 16 safety cap
       dual  :  ema_acc < acc_target  ⇒  λ relaxes (buys layers back)
                ema_acc ≥ acc_target  ⇒  λ tightens (pushes sparsity)
-      acc_target defaults to none (fixed λ); auto re-anchors the floor to
-      measured dense acc − margin instead of a hand-set constant (details: docs/training.md)
+               optional arm: acc_target = none (default) holds λ fixed; 'auto' re-anchors
+               the floor to measured dense acc − margin; KL self-distillation likewise
+               opt-in via --kl_coef — both cut from the default after falsification runs
+               (details: docs/training.md, docs/paper.md §3)
 ```
 
 Gating exists in two modes behind one switch (`gate_mode`): **threshold** (default,
@@ -77,11 +81,11 @@ per-layer gate) and **moe** (joint router above) — details in [docs/gating.md]
 
 | | MoD (2404.02258) | MoDification (2410.14268) | **Speaker** |
 |---|---|---|---|
-| decision | per layer: top-k **tokens**, k fixed a priori | per layer: threshold-p **tokens** (p≈0.5) | per token: ONE joint router over **layers** (top-p, k adapts) |
+| decision | per layer: top-k **tokens**, k fixed a priori | per layer: threshold-p **tokens** (p≈0.5) | per token: per-layer **threshold gates** (k adapts, priced by λ; a joint top-p router exists as `gate_mode=moe`) |
 | always-on layers | none | none (interleaved gating) | **shared layers selected by measured load** |
-| conversion | from-scratch training | ~10B-token finetune | gating-first finetune (LoRA + KL + dual) → profile → promote → resume |
+| conversion | from-scratch training | ~10B-token finetune | gating-first finetune (LoRA joint + fixed price + rollout UL) → profile → promote → resume |
 | efficiency target | training FLOPs / sampling speed | long-context serving latency/memory | **edge-side VRAM: residency + sparse KV + scheduling** |
-| accuracy machinery | weighted residual + BCE | gate scaling + load objective R | distillation + budget dual + unlikelihood |
+| accuracy machinery | weighted residual + BCE | gate scaling + load objective R | joint LoRA repair + fixed depth price + rollout unlikelihood |
 
 MoD and MoDification make the *forward pass* cheaper; Speaker additionally makes the
 *memory* smarter: with per-token demand concentrated on few layers, only fixed + hot
@@ -114,6 +118,7 @@ Speaker/
     dual.py           #   DualController: accuracy EMA + warmup gate + λ adaptation
     ul.py             #   anti-repetition: n-gram unlikelihood terms + rep3 probes
     checkpoint.py     #   ckpt I/O: gate-key filtering / prefix stripping / clean base (+safetensors)
+    converge.py       #   StopOnPlateau: shared early-stop rule across the five training scripts
     train_common.py   #   shared training boilerplate (device/tokenizer/model/LoRA/groups)
     log.py            #   primary logger (loguru): console + run.log + JSONL sinks, no tee
   docs/               # per-mechanism documentation: gating / training / inference / related work
@@ -153,7 +158,8 @@ base = AutoModelForCausalLM.from_pretrained(model_id, dtype="auto", device_map="
                                             trust_remote_code=True)
 tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
-cfg = SpeakerConfig.from_model_config(base.config, kmax=6, sparsity_price=0.03, acc_target=0.55)
+cfg = SpeakerConfig.from_model_config(base.config, gate_mode="threshold",
+                                      kmax=16, sparsity_price=0.0005, acc_target=None)
 model = convert_to_speaker(base, cfg)  # wraps the layer list in place
 
 out = model(input_ids=input_ids, attention_mask=mask, labels=labels)
@@ -172,10 +178,16 @@ python3 pretrain/train.py --device cuda:0 --max_steps 500 --num_layers 12 --hidd
     --shared_head 2 --shared_tail 2 --save_dir ./ckpt/speaker_pretrain
 
 # Track B — finetune (mainline): gating-first, no prior fixed layers
+# CLI defaults = the validated v0.2.0 long_4k recipe (threshold, kmax 16, λ 0.0005,
+# dual off, rollout-UL 128 tok × 0.3); flags shown explicitly for clarity
 python3 finetune/train.py --model_id ./models/Qwen2.5-7B-Instruct --use_lora \
-    --use_chat_template --always_head 0 --always_tail 0 --ul_coef 0.3 \
-    --eval_every 2000 --patience 10 --device cuda:0 --anneal_steps 2000 \
-    --max_samples 20000 --save_dir ./ckpt/run
+    --use_chat_template --always_head 0 --always_tail 0 \
+    --gate_mode threshold --kmax 16 --sparsity_price 0.0005 --acc_target none \
+    --ul_mode rollout --rollout_tokens 128 --ul_coef 0.3 \
+    --eval_every 2000 --patience 10 --anneal_steps 2000 --max_steps 4000 \
+    --device cuda:0 --save_dir ./ckpt/run
+# converged headline (Qwen2.5-7B, full 904K SFT): held-out Δacc +4.3pt at k 16.1/28,
+# weight demand −42% (7.51 vs 13.05 GB), KV −41%, 128-tok ROUGE-L ≈ dense
 # then: profile measured load -> promote fixed layers (>=90%) -> resume on new structure
 python3 finetune/profile_layers.py --ckpt ./ckpt/run --threshold 0.9 --out ./ckpt/run_fixed
 python3 finetune/train.py --resume_dir ./ckpt/run_fixed ...
@@ -226,10 +238,13 @@ the paper's third-party `model_patch.py` under `baselines/router-tuning/utils/mo
 
 ## 9. Roadmap
 
-Architecture status: dual-mode gating behind `gate_mode` — **moe** mainline (joint
-router + top-p + weighted residual; differentiable budget via soft inclusion) and
-**threshold** legacy (per-layer router + τ, kept for old checkpoints). Gating overhead
-~20K params on 0.5B is negligible.
+Architecture status: dual-mode gating behind `gate_mode` — **threshold** mainline
+(per-layer router + τ + STE + kmax cap; the v0.2.0 validated default recipe and the
+finetune CLI default) and **moe** (MoL joint router + top-p + pmax-weighted residual;
+kept in-tree, off the mainline after the renorm-collapse diagnosis — pmax reweighting
+recovers +13pt, partial). Note: `SpeakerConfig`'s library-level default is still
+`"moe"`; training entry points pin `threshold`. Gating overhead ~41K params on 0.5B
+(threshold) / ~20.5K (moe) is negligible.
 
 - **P1 from-scratch scale-up**: smoke passed; pending scale-up validation of the
   "syntax in fixed layers / reasoning in middle layers" emergence.
@@ -242,6 +257,8 @@ router + top-p + weighted residual; differentiable budget via soft inclusion) an
 - **T1 (deferred)**: difficulty head decides k, router decides which; or decide masks
   at prefill and reuse at decode (composable with sparse KV).
 - **T2 (threshold mode only)**: make τ actually learn (own lr group).
-- **T3 one-shot affinity routing**: ✅ done — landed as `gate_mode="moe"` mainline.
-- **T4 dense self-distillation**: ✅ done (`--kl_coef`, biggest accuracy lever).
+- **T3 one-shot affinity routing**: ✅ done — landed as `gate_mode="moe"`; off the
+  validated mainline (renorm collapse diagnosed, pmax reweighting recovers +13pt, partial).
+- **T4 dense self-distillation**: implemented (`--kl_coef`); cut from the default —
+  kl = 0 already recovers past dense, the remaining gap is data format (docs/paper.md §2.4).
 - **T5 SOTA baseline comparison**: ✅ done (`baselines/eval_compare.py`, one command).

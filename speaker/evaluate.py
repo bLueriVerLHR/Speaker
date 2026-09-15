@@ -91,7 +91,10 @@ def eval_heldout(model, texts, collate_fn, batch_size=4,
             if k_provider is not None:
                 k = k_provider(b)
             else:
-                getk = getattr(model, "get_active_counts", None)
+                # Report every layer that computes for a token (gated + always-on).
+                # get_active_counts (gated only) is for router diagnostics.
+                getk = getattr(model, "get_total_counts", None) \
+                    or getattr(model, "get_active_counts", None)
                 k = getk() if callable(getk) else None
             if k is not None:
                 kv = k.to(valid.device)[valid].float()

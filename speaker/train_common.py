@@ -68,11 +68,13 @@ def build_model(model_id: str, device: torch.device, dtype=torch.bfloat16,
 
 
 def split_train_eval(data_path: str, max_samples: int, eval_samples: int,
-                     tok=None, use_chat: bool = False):
+                     tok=None, use_chat: bool = False, single_turn: bool = False):
     """Standard slice: first max_samples for training / the following eval_samples for eval.
-    Returns (train_ds, eval_texts)."""
+    Returns (train_ds, eval_texts). single_turn truncates each record to its first
+    round at build time (both train and eval slices see the same text protocol)."""
     from data.sft import SFTDataset
-    full = SFTDataset(data_path, max_samples + eval_samples, tok=tok, use_chat=use_chat)
+    full = SFTDataset(data_path, max_samples + eval_samples, tok=tok,
+                      use_chat=use_chat, single_turn=single_turn)
     eval_texts = full.samples[max_samples:max_samples + eval_samples]
     full.samples = full.samples[:max_samples]
     return full, eval_texts

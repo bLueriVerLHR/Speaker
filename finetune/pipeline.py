@@ -16,6 +16,7 @@ from transformers import AutoModelForCausalLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from speaker import SpeakerConfig, convert_to_speaker  # noqa: E402
+from speaker.config import budget_pin_warnings  # noqa: E402
 from speaker.metrics import distill_kl_loss, estimate_act_mb, per_token_nll  # noqa: E402
 from speaker.evaluate import ema_update, eval_heldout, format_k_quartile  # noqa: E402
 from speaker.ruler import AccRuler  # noqa: E402 (P0: one accuracy scale everywhere)
@@ -80,7 +81,8 @@ def run_finetune(hp):
 
     full, eval_texts = split_train_eval(
         hp.data_path, hp.max_samples, hp.eval_samples,
-        tok=tok if hp.use_chat_template else None, use_chat=hp.use_chat_template)
+        tok=tok if hp.use_chat_template else None, use_chat=hp.use_chat_template,
+        single_turn=hp.single_turn)
     if not eval_texts:
         logger.warning(f"eval slice is empty ({len(full.samples)} lines in file, max_samples {hp.max_samples}); "
                        f"final eval skipped! Check that the build-time filter matches the SFTDataset protocol")
@@ -122,6 +124,7 @@ def run_finetune(hp):
         cfg.temp_affinity = hp.temp_affinity
         cfg.gumbel_scale = hp.gumbel_scale
         cfg.sparsity_price = hp.sparsity_price
+        cfg.over_budget_coef = hp.over_budget_coef
         cfg.acc_target = acc_floor
         cfg.price_warmup_steps = hp.price_warmup
         cfg.cos_reg_coef = hp.cos_reg_coef
@@ -136,6 +139,7 @@ def run_finetune(hp):
             always_on_tail=hp.always_tail, temp_affinity=hp.temp_affinity,
             gumbel_scale=hp.gumbel_scale, sparsity_price=hp.sparsity_price,
             budget_form=hp.budget_form, budget_target=hp.budget_target,
+            over_budget_coef=hp.over_budget_coef,
             tail_coef=hp.tail_coef, tail_temp=hp.tail_temp,
             price_adapt=hp.price_adapt, acc_target=acc_floor,
             diff_easy_nll=hp.diff_easy_nll, diff_hard_nll=hp.diff_hard_nll,
@@ -145,6 +149,12 @@ def run_finetune(hp):
         if hp.always_layers.strip():
             overrides["always_on_layers"] = parse_csv_list(hp.always_layers)
         cfg = SpeakerConfig.from_model_config(model.config, **overrides)
+        if hp.always_layers.strip():
+            dropped = [i for i in parse_csv_list(hp.always_layers)
+                       if not 0 <= i < cfg.num_hidden_layers]
+            if dropped:
+                logger.warning(f"always_layers {dropped} out of range "
+                               f"[0,{cfg.num_hidden_layers}) silently dropped")
     # Baked decode recipe (ed9/C): explicit CLI wins on fresh and on resume; None = legacy
     decode_updates = {}
     if hp.decode_rep_penalty is not None:
@@ -155,6 +165,8 @@ def run_finetune(hp):
         cfg.decode = {**(cfg.decode or {}), **decode_updates}
         logger.info(f"baked decode recipe {cfg.decode} into mod_config.json")
     logger.info(cfg.summary())
+    for _w in budget_pin_warnings(cfg):
+        logger.warning(_w)
     mod_model = convert_to_speaker(model, cfg)
     if not hp.device_map:
         # whole-card placement; under device_map sharding the wrapper's per-layer device
@@ -260,9 +272,10 @@ def run_finetune(hp):
             loss = lm_loss + on(aux or 0) + on(task or 0) + on(kl or 0)
             ema_lm = ema_update(ema_lm, lm_loss.item())
             ema_acc = dual.observe(step, acc_item)
-            # stats (pure k basis)
+            # stats: count every layer that computes for a token
+            # (gated selections + always-on) — this is the deployment number
             with torch.no_grad():
-                counts = mod_model.get_active_counts()
+                counts = mod_model.get_total_counts()
                 valid = b["attention_mask"].bool()
                 kv = valid.to(counts.device) if counts is not None else valid
                 if counts is not None and kv.any():
@@ -298,7 +311,8 @@ def run_finetune(hp):
             if step % hp.log_interval == 0:
                 rate = window_tokens / max(time.time() - window_t0, 1e-6)
                 sp = mod_model.get_layer_sparsity()
-                spars = sum(sp[i] for i in cfg.gated_layers) / max(len(cfg.gated_layers), 1)
+                # skip rate over all layers (always-on layers never skip)
+                spars = sum(sp.values()) / max(len(sp), 1)
                 mem_gb = torch.cuda.memory_allocated(device) / 1024**3 \
                     if device.type == "cuda" else 0.0
                 # repetition visibility (P2): GT-side n-gram recurrence density, near-zero

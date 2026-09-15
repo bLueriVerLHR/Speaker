@@ -8,10 +8,10 @@ Wall-clock at batch size 1 does not reflect the savings (wrapper overhead ~12%
 eats the FLOP gap; r4/r7 both re-confirmed). The honest currency is **demand**:
 what a token's execution actually requires,
 
-- **weights**: `k × bytes-per-layer` (GB/token; 7B reference: dense 13.05 vs
-  Speaker 7.11 at k=15.3/28 → −46%),
+- **weights**: `k × bytes-per-layer` (GB/token; frozen 7B headline: dense 13.05 vs
+  7.51 at k = 16.1/28 → **−42%**),
 - **KV cache**: `k × bytes-per-layer-KV` at the serving context length
-  (MB/token; 31.2 vs 57.3 at 1024 ctx → −46%).
+  (MB/token; **−41%** at k = 16.1/28, 1024 ctx).
 
 Aggregate this from `probe_kdist` JSONs (the one-off `tools/mem_demand.py`
 aggregator is archived). Process-level
@@ -40,9 +40,12 @@ model.generate(**tok("hello", return_tensors="pt").to("cuda:0"), max_new_tokens=
   that into wall-clock needs kernel/batched-ragged execution (current wrapper
   overhead eats most of it — measured wall-clock parity with dense on 7B).
 
-Honest caveats measured so far: decode-time k drifts higher than training-time k
-(7.4 → ~11.7 on self-generated prefixes — the gate opens more layers on its own
-rollouts); free generation quality needs the rollout-UL training remedy.
+Honest caveats (frozen accounting, docs/paper.md §2.3): training-time **soft** k
+undercounts deployment **hard** k by ~25% (soft 16.4 → hard 20.3 probed on the same
+checkpoint; hard-probed 20.3 ≈ free-decoded 20.4 — no position effect, no
+self-generation drift, `--pos_bins` probe) — deployment accounting uses probed hard
+k only, never logged soft k. Free generation quality needs the rollout-UL training
+remedy.
 
 ## Mode 2 — static CPU/GPU placement (memory)
 

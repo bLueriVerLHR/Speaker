@@ -55,7 +55,7 @@ def main(
     reserve_gb: Annotated[float, typer.Option("--reserve_gb", help="KV-cache / activation / logits reserve subtracted before weight packing")] = 2.0,
     strategy: Annotated[Literal["random", "lru", "lfu"], typer.Option("--strategy")] = "lfu",
     reschedule_every: Annotated[int, typer.Option("--reschedule_every", help="re-plan residency every K generations (0 = static placement)")] = 5,
-    data_path: Annotated[str, typer.Option("--data_path")] = "/home/hdd/sanzo/minimind/dataset/sft_t2t_mini.jsonl",
+    data_path: Annotated[str, typer.Option("--data_path")] = "./data/sft_t2t_mini.jsonl",
     offset: Annotated[int, typer.Option("--offset", help="fresh (unseen) slice offset")] = 904300,
     n: Annotated[int, typer.Option("--n")] = 20,
     prompt_len: Annotated[int, typer.Option("--prompt_len")] = 64,

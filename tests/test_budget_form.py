@@ -35,6 +35,30 @@ def test_mean_is_legacy(kk_price):
     assert out.item() == pytest.approx(0.1 * 2.5)
 
 
+def test_sqdev_value(kk_price):
+    kk, price = kk_price
+    out = _budget_core(kk, _cfg(budget_form="sqdev", budget_target=3.0), price)
+    expect = 0.1 * ((kk - 3.0).pow(2)).mean()
+    assert out.item() == pytest.approx(expect.item())
+
+
+def test_sqdev_restores_from_both_sides():
+    price = 0.1
+    for kk, want_sign in [(torch.tensor([5.0, 6.0]), 1.0),   # above T: press down
+                          (torch.tensor([1.0, 2.0]), -1.0)]:  # below T: push up
+        kk = kk.requires_grad_(True)
+        out = _budget_core(kk, _cfg(budget_form="sqdev", budget_target=3.0), price)
+        out.backward()
+        assert kk.grad is not None and kk.grad.numel() > 0
+        assert float(kk.grad.mean().sign()) == want_sign
+
+
+def test_sqdev_requires_target():
+    with pytest.raises(ValueError):
+        SpeakerConfig(num_hidden_layers=6, hidden_size=32,
+                      budget_form="sqdev", budget_target=0.0)
+
+
 def test_hinge_below_is_zero_above_is_excess(kk_price):
     kk, price = kk_price
     assert _budget_core(kk, _cfg(budget_form="hinge", budget_target=2.0),
@@ -115,7 +139,7 @@ def test_mean_matches_legacy_formula():
 
 def test_forms_run_and_gate_grads():
     for mode in ("threshold", "moe"):
-        for form in ("mean", "hinge", "tail"):
+        for form in ("mean", "hinge", "tail", "sqdev"):
             mod, am = _mod(mode, budget_form=form, budget_target=2.0)
             loss = mod.get_budget_loss(am)
             assert torch.isfinite(loss).item()
@@ -142,3 +166,23 @@ def test_config_rejects_bad_values():
         SpeakerConfig(num_hidden_layers=6, hidden_size=32, tail_coef=-0.5)
     with pytest.raises(ValueError):
         SpeakerConfig(num_hidden_layers=6, hidden_size=32, tail_temp=0.0)
+
+
+def test_over_budget_cap_off_by_default_and_composable():
+    # the cap is an opt-in extra that combines with any budget form
+    from speaker.hparams import FinetuneConfig
+    assert FinetuneConfig().over_budget_coef == 0.0
+    assert FinetuneConfig(over_budget_coef=0.05).over_budget_coef == 0.05
+    mod, am = _mod("threshold", budget_form="sqdev", budget_target=4.0)
+    mod.eval()
+    x = torch.randn(2, 8, 32)
+    mod(hidden_states=x, attention_mask=am)
+    base = mod.get_budget_loss(am)
+    assert base is not None
+    mod.mod_config.over_budget_coef = 0.05
+    capped = mod.get_budget_loss(am)
+    ste, _, _ = mod._stack_masks()
+    k = ste.sum(-1)[am.bool()] + len(mod.mod_config.always_on_layers)
+    expect = base + 0.05 * torch.clamp(
+        k - mod.mod_config.kmax, min=0).pow(2).mean()
+    assert capped.item() == pytest.approx(expect.item())

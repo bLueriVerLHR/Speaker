@@ -3,7 +3,7 @@
 A sweep YAML declares one base command plus override axes; this expands the
 cartesian product and either prints (``--dry-run``, default) or executes each
 run sequentially, tee-ing stdout to ``.logs/<TS>_<name>.log`` per the repo
-runtime-log convention. For neu-sbox submissions, dry-run the command lines
+runtime-log convention. For job-queue submissions, dry-run the command lines
 and paste them into the submit template (AGENTS.md) — one quoted string each.
 
 Example (configs/moe_kmax.yaml):

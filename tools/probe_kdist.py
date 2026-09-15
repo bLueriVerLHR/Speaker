@@ -26,7 +26,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from data.sft import SFTDataset, make_collate
-from speaker import SpeakerConfig
 from speaker.evaluate import chunked_nll_correct
 from baselines.assemble import assemble  # noqa: E402
 from baselines.lib import collect_mdf_stats, collect_modd_stats, eval_heldout_rt
@@ -239,15 +238,14 @@ def main(
         asm = assemble(ckpt, model_id, lora, device, skip_mode=None)
         w = asm.model
         m = w
-        oc = SpeakerConfig.from_json(os.path.join(ckpt, "mod_config.json"))
-        n_always = len(oc.always_on_layers)
         gp = sum(p.numel() for p in w.get_router_parameters())
         res[tag] = {"weights_gb": weights_gb(m), "gate_params": gp,
                     "gate_share": gp / sum(p.numel() for p in m.parameters())}
 
         def ours_k(valid, _w=w):
-            c = _w.get_active_counts()
-            return (c[valid] + n_always).float() if c is not None else None
+            # get_total_counts already includes the always-on layers
+            c = _w.get_total_counts()
+            return c[valid].float() if c is not None else None
 
         def ours_layers(valid, _w=w):
             nv = valid.sum().item()
