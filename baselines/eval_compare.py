@@ -19,7 +19,7 @@ from typing import Annotated, Literal
 
 import torch
 import typer
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from baselines.assemble import assemble
@@ -39,10 +39,8 @@ app = typer.Typer(add_completion=False)
 
 
 def load_base(model_id, device):
-    m = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=torch.bfloat16, device_map=None,
-        trust_remote_code=True, low_cpu_mem_usage=True).to(device)
-    return m
+    from speaker.train_common import build_model
+    return build_model(model_id, device, dtype=torch.bfloat16)
 
 
 @app.command()

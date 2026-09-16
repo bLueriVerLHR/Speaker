@@ -37,8 +37,8 @@ import torch
 import typer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from speaker import SpeakerConfig, convert_to_speaker  # noqa: E402
-from speaker.checkpoint import load_gate, strip_promoted_gate  # noqa: E402
+from baselines.assemble import ModelBuilder  # noqa: E402
+from speaker.checkpoint import strip_promoted_gate  # noqa: E402
 from speaker.load_profile import (  # noqa: E402
     estimate_layer_bytes,
     plan_placement,
@@ -47,7 +47,7 @@ from speaker.load_profile import (  # noqa: E402
     select_fixed_layers,
 )
 from speaker.log import logger  # noqa: E402
-from speaker.train_common import build_model, build_tok, eval_slice, resolve_device, wrap_lora  # noqa: E402
+from speaker.train_common import build_tok, eval_slice, resolve_device  # noqa: E402
 from data.sft import make_collate  # noqa: E402
 
 
@@ -80,16 +80,12 @@ def main(
     texts = eval_slice(data_path, offset, n)
     coll = make_collate(tok, device, 256)
 
-    model = build_model(model_id, device)
-    if use_lora:
-        model = wrap_lora(model, lora_rank, lora_alpha, lora_targets)
-    cfg = SpeakerConfig.from_json(os.path.join(ckpt, "mod_config.json"))
-    mod = convert_to_speaker(model, cfg).to(device)
-    missing, unexp = load_gate(mod, ckpt)
-    if missing or unexp:
-        logger.warning(f"gate.pt loaded, missing {len(missing)} unexpected {len(unexp)}")
-    else:
-        logger.info("gate.pt loaded, no missing/unexpected keys")
+    lora = (dict(rank=lora_rank, alpha=lora_alpha, targets=lora_targets)
+            if use_lora else None)
+    asm = (ModelBuilder(model_id, lora=lora, dtype=torch.bfloat16)
+           .from_ckpt(ckpt).skip_mode("soft").build(device))
+    mod = asm.model
+    cfg = mod.mod_config
 
     # profile: soft mode (all layers execute; the hard mask is the deployment load;
     # trajectories do not drift from layer skipping)

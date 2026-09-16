@@ -28,7 +28,11 @@ memory. The default operating point sits on the **recovery knee**: at k = 17 the
 formal cell turns negative (−1.7pt); at k ≤ 14 every recipe family tested breaks
 (−15 to −17pt). 128-token generation holds ROUGE-L above the raw-dense line
 (0.211 vs 0.160; dense-ft 0.332) with a repetition residual (seq-rep-4 0.320 vs
-raw 0.053, dense-ft 0.211) attributed to SFT finetuning, not gating (§2.4). We
+raw 0.053, dense-ft 0.211) attributed to SFT finetuning, not gating (§2.4). In the
+memory-constrained regime (single GPU capped at 6–8 GB VRAM, 16 CPU cores, bf16
+CPU-offload placement) the same hard skips convert to measured wall-clock:
+**1.34× / 1.76× over equal-budget dense-ft**, while a masking baseline
+(MoDification) that computes every layer buys none (§4.8). We
 also report the honest negatives that shaped the recipe: capacity-pinned routing
 (MoD **[Paper]**) buys neither sparsity nor accuracy; frozen-base gate-only tuning
 (Router-Tuning **[Paper]**) self-locks near-dense; regularization-pressure tuning
@@ -67,8 +71,11 @@ contradict the three assumptions of vLLM/SGLang-style serving **[Paper:
 PagedAttention]**: CUDA graphs require static execution paths, continuous batching
 requires all requests to want the same layers at the same step, and paged KV
 assumes every layer holds every token's KV. Our contribution is therefore
-training-side repair plus demand accounting, not latency: measured wall-clock
-today shows no win (research wrapper ≈ +45% ms/tok at bs1, §4.4). The honest path
+training-side repair plus demand accounting, not latency: in the whole-card
+resident regime measured wall-clock shows no win (research wrapper ≈ +45% ms/tok
+at bs1, §4.4). Where memory binds, however, skipping already pays today: under a
+6–8 GB VRAM cap with CPU offload, hard skips deliver 1.34–1.76× over equal-budget
+dense-ft (§4.8). The honest path
 to serving is a per-request *static* mask (profile → freeze the active set → run a
 static subgraph) — a separate serving paper, listed in §6, not claimed here.
 
@@ -229,9 +236,10 @@ dense-ft 0.332) — the price of −28% weight/KV demand. dense-ft also loops
 ### 4.4 Honest costs
 
 Training throughput −25% (rollout-128); inference wall-clock no win in the
-research wrapper (+45% ms/tok at bs1 greedy: 28.0 → 40.6 over 30×128tok — FLOP
-savings need kernel/ragged execution); 30-prompt generation metrics are noisy
-screens next to human reads.
+whole-card resident research wrapper (+45% ms/tok at bs1 greedy: 28.0 → 40.6 over
+30×128tok — FLOP savings need kernel/ragged execution); in the memory-constrained
+offload regime the same skips already pay 1.34–1.76× (§4.8); 30-prompt generation
+metrics are noisy screens next to human reads.
 
 ### 4.5 Robustness & falsifications (r9)
 
@@ -290,6 +298,51 @@ default recipe is the minimal-depth recovery point of its family.** −38% memor
 purchasable at −1.7pt formal; k ≤ 14 breaks recovery in every recipe family tested
 (fixed4 −16.7; anchor-only −15.5).
 
+### 4.8 Constrained-memory inference (edge6g/edge8g, 0916)
+
+**Regime.** Single GPU under a hard allocator cap of {6, 8} GB, 16 pinned CPU
+cores, bf16 weights, CPU-offload placement (§3 Deployment: fixed + hot layers
+GPU-resident, cold layers compute on the CPU). Inference-only, zero retraining:
+ours = the §4.2 converged default (r8c_long_4k), dense-ft = the repair-budget run
+(r7_dense), MoDification α=0.01 = r7_mdf_a01. Non-ours families ride the identical
+wrapper+placement path (all-layers-always-on wrap, `force_always_gpu` off), so the
+methods differ by their forward alone. Protocol: fresh slice offset 904300, 20
+prompts × 128 tokens, greedy, seed 42.
+
+| budget | method | ms/tok | tok/s | resident | peak GB |
+|---|---|---|---|---|---|
+| 6 GB | **ours (hard skip)** | **182** | **5.5** | 4/28 | 4.07 |
+| 6 GB | dense-ft | 247 | 4.0 | 4/28 | 4.07 |
+| 6 GB | MoDification α0.01 | 251 | 4.0 | 4/28 | 4.07 |
+| 8 GB | **ours (hard skip)** | **124** | **8.1** | 10/28 | 6.88 |
+| 8 GB | dense-ft | 219 | 4.6 | 10/28 | 6.88 |
+| 8 GB | MoDification α0.01 | 262 | 3.8 | 10/28 | 6.88 |
+
+**Verdicts [Ours].**
+
+- **Skipping converts to wall-clock exactly where memory binds.** 1.34× (6 GB) /
+  1.76× (8 GB) vs equal-budget dense-ft; measured skips are 8.2 layers/token —
+  matching the probed hard total-k 20/28. The training-side depth accounting
+  predicts deployment behavior.
+- **Masking is not skipping** (the control this experiment was built for):
+  MoDification scales layer outputs but executes all 28 — same speed as dense-ft
+  (ratio 1.02–1.20, i.e. pure router tax) at either budget. In constrained
+  deployment the only real acceleration comes from hard skips.
+- **Budget elasticity favors sparsity.** 6→8 GB buys ours 1.49× but dense-ft only
+  1.13×: the residency plan packs frequently-executed layers onto the GPU while
+  the layers our gates skip stay on the CPU — unpaid.
+- **Between-generation LFU rescheduling: zero gain** (reschedule events = 0 in
+  every arm; activation frequencies are flat — consistent with §2.1's flat middle
+  band and the position-flat probes of §2.3). The scheduler is machinery without
+  a workload at this operating point.
+- **IO tax dominates the small-budget regime.** Untied embedding + lm_head (2.18
+  GB) consume a third of a 6 GB allowance, leaving only 4/28 decoder layers
+  resident. At 192-token prompts the weight term, not KV, sets the budget — our
+  −28% KV advantage is invisible at short context (it binds at long context, §1).
+- **Variance discipline.** MoDification's 8 GB arm read 314 then 261.6 ms/tok on
+  re-run (18% apart) — inside the ±24% between-process band; single reads within
+  that band are not signal.
+
 ## 5 Related work (one-paragraph placements)
 
 - **MoD [Paper]** — token-choice top-k capacity + BCE, from-scratch; k is
@@ -307,7 +360,10 @@ purchasable at −1.7pt formal; k ≤ 14 breaks recovery in every recipe family 
 
 ## 6 Limitations & future work
 
-1. Wall-clock parity (needs ragged kernels; the research wrapper pays +45% ms/tok).
+1. Wall-clock parity in the whole-card resident regime (needs ragged kernels; the
+   research wrapper pays +45% ms/tok). Partially answered where memory binds: under
+   a 6–8 GB VRAM cap with CPU offload, hard skips already pay 1.34–1.76× over
+   equal-budget dense-ft, and a masking baseline pays nothing (§4.8).
 2. Repetition residual vs raw dense (SFT-finetuning artifact shared with dense-ft;
    format fix falsified; decode-time n-gram backstop works; a data-side cure is open).
 3. **Resolved (0916):** the acc–k frontier below k ≈ 20 is measured — recovery
@@ -337,5 +393,8 @@ purchasable at −1.7pt formal; k ≤ 14 breaks recovery in every recipe family 
 - Sparse tax: r10_tax_{off20k_chat,ho_raw}.json (r8c vs r7_dense, same process).
 - Recovery knee: r10_kf16 / r10_kf12 + kf_eval_*.json, kf_probe_*.json, kf_gen.json;
   no-cap control r10_knee12/knee8 (λ-only, k → 27) (0916).
+- Constrained-memory inference: edge6g/ + edge8g/ reports (tools/edge_bench.py
+  `--vram_cap_gb`, taskset 16 cores; ours_lfu/ours_static/dense_static/mdf_static
+  ×{6,8}GB; mdf 8GB recheck inside the ±24% band) (0916).
 - Checkpoints: `r8c_long_4k`, `r7_dense`, `r10_{T*,kf16,kf12}` (formal table inputs);
   plan & pre-registered readout rules: .archive/0915/PLAN.md.

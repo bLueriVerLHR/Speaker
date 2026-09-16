@@ -350,7 +350,10 @@ def run_finetune(hp):
                      best=stopper.best, ema_lm=ema_lm, k=chk.get("mean_k"))
                 # long-run insurance: overwrite a small ckpt at every plateau beat (recoverable on crash, no waiting for the final state)
                 save_gate(mod_model, hp.save_dir, extra_marks=("lora_",))
-                cfg.to_json(os.path.join(hp.save_dir, "mod_config.json"))
+                cfg.to_json(os.path.join(hp.save_dir, "mod_config.json"), extra={
+                    "use_lora": bool(hp.use_lora), "lora_rank": hp.lora_rank,
+                    "lora_alpha": hp.lora_alpha, "lora_targets": hp.lora_targets,
+                })
                 mk = chk.get("mean_k")
                 event(f"step {step} subset_loss {chk['loss']:.4f} "
                       f"best {stopper.best} k {mk if mk is not None else '-'}, ckpt saved")
@@ -370,7 +373,10 @@ def run_finetune(hp):
         if stopper.capped(step):
             break
 
-    cfg.to_json(os.path.join(hp.save_dir, "mod_config.json"))
+    cfg.to_json(os.path.join(hp.save_dir, "mod_config.json"), extra={
+        "use_lora": bool(hp.use_lora), "lora_rank": hp.lora_rank,
+        "lora_alpha": hp.lora_alpha, "lora_targets": hp.lora_targets,
+    })
     save_gate(mod_model, hp.save_dir, extra_marks=("lora_",))
     if hp.save_full:
         assert not hp.use_lora, "--save_full only supports non-LoRA (peft requires adapter save)"
@@ -385,6 +391,5 @@ def run_finetune(hp):
                     f"| mod loss {mod_res['loss']:.3f} acc {mod_res['acc']:.3f} "
                     f"(Δloss {mod_res['loss'] - dense_res['loss']:+.3f} Δacc {mod_res['acc'] - dense_res['acc']:+.3f}) "
                     f"| {format_k_quartile(mod_res)}")
-
 
 

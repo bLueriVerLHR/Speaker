@@ -1,9 +1,9 @@
 """Five-way k distribution / per-layer execution rate / peak GPU memory probe (for r1/r2
 attribution, reproducible evidence).
 
-total formulation: ours get_active_counts covers gated layers only, so total k = gated + n_always;
-MoD's k already includes shared (fixed) layers. This script uniformly uses the total formulation
-(differs from eval_compare's headline k, see the r1 attribution row in AGENTS.md).
+Total formulation: ours uses ``get_total_counts`` (gated selections plus
+always-on layers), matching deployment accounting and the other evaluation tools.
+MoD's k already includes shared (fixed) layers.
 
 Usage:
   python3 tools/probe_kdist.py --ours ./ckpt/ours_q05_full \
@@ -23,7 +23,7 @@ import typer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from data.sft import SFTDataset, make_collate
 from speaker.evaluate import chunked_nll_correct
@@ -35,10 +35,8 @@ from speaker.log import logger  # noqa: E402
 from speaker.terminal import setup_terminal, track
 
 def load_base(src, device):
-    m = AutoModelForCausalLM.from_pretrained(
-        src, dtype=torch.bfloat16, device_map=None,
-        trust_remote_code=True, low_cpu_mem_usage=True).to("cpu")
-    return m
+    from speaker.train_common import build_model
+    return build_model(src, torch.device("cpu"), dtype=torch.bfloat16)
 
 
 def fwd_eval(model, texts, coll, device, batch_size, k_fn=None, layer_fn=None,

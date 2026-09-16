@@ -27,13 +27,13 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
 
 import torch
 import typer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from baselines.assemble import ModelBuilder  # noqa: E402
+from baselines.assemble import ModelBuilder, detect_family  # noqa: E402
 from tools.gen_metrics import rouge_l, seq_rep  # noqa: E402 (standard metrics; single source)
 from tools.eval_gen import load_texts  # noqa: E402
 from tools._common import module_gb  # noqa: E402
@@ -51,10 +51,11 @@ def main(
     lora_alpha: Annotated[int, typer.Option("--lora_alpha")] = 16,
     lora_targets: Annotated[str, typer.Option("--lora_targets")] = "q_proj,v_proj",
     device: Annotated[str, typer.Option("--device")] = "cuda:0",
+    vram_cap_gb: Annotated[float, typer.Option("--vram_cap_gb", help="hard allocator cap in GB (0 = off); pins the experiment's VRAM allowance regardless of the card size")] = 0.0,
     gpu_budget_gb: Annotated[float, typer.Option("--gpu_budget_gb", help="simulated edge GPU allowance for WEIGHTS (decoder layers + IO modules)")] = 20.0,
     reserve_gb: Annotated[float, typer.Option("--reserve_gb", help="KV-cache / activation / logits reserve subtracted before weight packing")] = 2.0,
-    strategy: Annotated[Literal["random", "lru", "lfu"], typer.Option("--strategy")] = "lfu",
-    reschedule_every: Annotated[int, typer.Option("--reschedule_every", help="re-plan residency every K generations (0 = static placement)")] = 5,
+    strategy: Annotated[Optional[Literal["random", "lru", "lfu"]], typer.Option("--strategy")] = None,
+    reschedule_every: Annotated[Optional[int], typer.Option("--reschedule_every", help="re-plan residency every K generations (0 = static placement)")] = None,
     data_path: Annotated[str, typer.Option("--data_path")] = "./data/sft_t2t_mini.jsonl",
     offset: Annotated[int, typer.Option("--offset", help="fresh (unseen) slice offset")] = 904300,
     n: Annotated[int, typer.Option("--n")] = 20,
@@ -74,15 +75,35 @@ def main(
         torch.set_num_threads(threads)
     torch.manual_seed(seed)
     device = torch.device(device)
+    if vram_cap_gb > 0 and device.type == "cuda":
+        total_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+        torch.cuda.set_per_process_memory_fraction(vram_cap_gb / total_gb, device)
+        logger.info(f"[edge] allocator hard cap {vram_cap_gb:.2f}GB "
+                    f"(fraction {vram_cap_gb / total_gb:.3f} of {total_gb:.1f}GB)")
+    family = detect_family(ckpt)
+    if family != "ours" and (strategy is not None or reschedule_every is not None):
+        raise ValueError("--strategy/--reschedule_every apply only to ours checkpoints")
+    strategy = strategy or "lfu"
+    reschedule_every = 5 if reschedule_every is None else reschedule_every
     logger.info(f"[edge] threads {torch.get_num_threads()} | budget {gpu_budget_gb}GB "
                 f"(reserve {reserve_gb}GB) strategy {strategy}")
     lora = (dict(rank=lora_rank, alpha=lora_alpha, targets=lora_targets)
             if use_lora else None)
 
     # ---- model: whole backbone in host RAM, assembled from the ckpt, hard skip mode ----
+    # dense-ft ckpts ride the exact same wrapper/placement machinery (all layers
+    # always-on, zero gates) so ours-vs-dense differs by the gating alone.
     asm = (ModelBuilder(model_id, lora, dtype=torch.bfloat16)
            .from_ckpt(ckpt).skip_mode("hard").build(None))
     m = asm.model
+    if family != "ours":
+        # dense-ft / mdf / modd / rt: ride the exact same wrapper + placement machinery
+        # (all layers always-on, zero speaker gates) so every method differs by its own
+        # forward alone; mdf's monkeypatched layer forward and its router submodule live
+        # inside the layer module and move with it.
+        from speaker.wrapper import convert_to_speaker
+        m = convert_to_speaker(m, hf_config=m.config,
+                               always_on_layers=list(range(m.config.num_hidden_layers)))
     cfg = m.mod_config
     if cfg.gate_mode != "threshold" and cfg.gate_mode != "moe":
         raise ValueError(f"unexpected gate_mode {cfg.gate_mode}")
@@ -91,7 +112,6 @@ def main(
             f"the last decoder layer ({cfg.num_hidden_layers - 1}) is NOT always-on; the "
             f"final-norm/lm_head epilogue is placed on the GPU and needs the tail fixed "
             f"(re-promote the ckpt with --always_tail >= 1)")
-    tok_m = None
     from speaker.train_common import build_tok
     tok_m = build_tok(model_id)
 
@@ -106,18 +126,46 @@ def main(
                 f"{type(norm).__name__ if norm is not None else None}, lm_head "
                 f"{type(lm_head).__name__ if lm_head is not None else None} = {io_gb:.2f}GB")
 
-    # ---- residency scheduling over the remaining budget ----
-    sched = m.schedule_placement(
-        strategy,
-        gpu_total_gb=max(gpu_budget_gb - io_gb, 0.0),
-        reserve_gb=reserve_gb, gpu_device=str(device))
-    logger.info(f"[edge] {sched.describe()}")
+    # ---- residency over the remaining budget: ours schedules by activation counts,
+    # dense-wrap fills ascending by layer index (tail layer reserved: the final-norm/
+    # lm_head epilogue lives on the GPU and needs the last hidden state to arrive there)
     n_layers = cfg.num_hidden_layers
-    resident_weights = sched and sum(
-        sched.layer_bytes.get(i, 0) for i in (sched.resident or [])) / 1e9
-    total_weights = sum(sched.layer_bytes.values()) / 1e9
-    logger.info(f"[edge] resident decoder layers {len(sched.resident or [])}/{n_layers} "
-                f"{resident_weights:.2f}GB of {total_weights:.2f}GB (+IO {io_gb:.2f}GB)")
+    from speaker.load_profile import estimate_layer_bytes
+    lb = estimate_layer_bytes(m)
+    total_weights = sum(lb.values()) / 1e9
+    if family != "ours":
+        budget_b = max(gpu_budget_gb - io_gb - reserve_gb, 0.0) * 1e9
+        last_b = lb.get(n_layers - 1, 0)
+        if last_b > budget_b:
+            raise ValueError(
+                f"weights budget {budget_b / 1e9:.2f}GB cannot hold the last decoder "
+                f"layer ({last_b / 1e9:.2f}GB) — raise --gpu_budget_gb or cut --reserve_gb")
+        chosen, used_b = [], 0
+        for i in sorted(lb):
+            if i == n_layers - 1:
+                continue
+            if used_b + lb[i] <= budget_b - last_b:
+                chosen.append(i)
+                used_b += lb[i]
+        chosen.append(n_layers - 1)
+        used_b += last_b
+        resident = m.set_placement(chosen, gpu_device=str(device), cpu_device="cpu",
+                                   force_always_gpu=False)
+        sched = None
+        logger.info(f"[edge] dense fill: {len(resident)}/{n_layers} decoder layers on GPU "
+                    f"{used_b / 1e9:.2f}GB of {total_weights:.2f}GB (+IO {io_gb:.2f}GB; "
+                    f"strategy/reschedule n/a for dense)")
+    else:
+        sched = m.schedule_placement(
+            strategy,
+            gpu_total_gb=max(gpu_budget_gb - io_gb, 0.0),
+            reserve_gb=reserve_gb, gpu_device=str(device))
+        logger.info(f"[edge] {sched.describe()}")
+        resident = sched.resident or []
+        logger.info(f"[edge] resident decoder layers {len(resident)}/{n_layers} "
+                    f"{sum(lb.get(i, 0) for i in resident) / 1e9:.2f}GB "
+                    f"of {total_weights:.2f}GB (+IO {io_gb:.2f}GB)")
+    resident_weights = sum(lb.get(i, 0) for i in resident) / 1e9
 
     # ---- prompts (fresh slice, same construction as eval_gen) ----
     texts = load_texts(data_path, offset, n * 4)[:n * 4]
@@ -146,25 +194,26 @@ def main(
             torch.cuda.synchronize(device)
         dt = time.time() - t0
         out_txt = tok_m.decode(g[0, ids.shape[1]:], skip_special_tokens=True)
-        return out_txt, dt, ids.shape[1]
+        return out_txt, dt
 
-    # ---- warmup (lazy kernels / CUDA context) ----
+    # ---- warmup (lazy kernels / CUDA context; LFU cold-start counts) ----
+    m.eval()  # decode-time behavior: LoRA dropout off, hard-skip accounting on
+    # (train-mode hard skips still happen but are not counted, and peft dropout fires)
     for i in range(max(warmup, 0)):
         gen(prompts[i % len(prompts)])
-        if reschedule_every:
-            sched.reschedule()
+    if sched is not None:
+        sched.reschedule()  # data-driven initial plan; static arms freeze here
 
     # ---- measured run ----
     m.get_skip_hits(reset=True)
     torch.cuda.reset_peak_memory_stats(device) if device.type == "cuda" else None
-    outs, times, prefill = [], [], []
+    outs, times = [], []
     reschedule_events = 0
     for i, p in enumerate(prompts):
-        o, dt, pl = gen(p)
+        o, dt = gen(p)
         outs.append(o)
         times.append(dt)
-        prefill.append(pl)
-        if reschedule_every and (i + 1) % reschedule_every == 0:
+        if sched is not None and reschedule_every and (i + 1) % reschedule_every == 0:
             before = sched.resident
             sched.reschedule()
             reschedule_events += int(before != sched.resident)
@@ -176,13 +225,15 @@ def main(
     free_b, total_b = (torch.cuda.mem_get_info(device) if device.type == "cuda"
                        else (0, 0))
     report = {
-        "ckpt": ckpt, "model_id": model_id,
+        "ckpt": ckpt, "model_id": model_id, "family": family,
         "gate_mode": cfg.gate_mode, "layers": n_layers,
         "always_on": cfg.always_on_layers, "gated": len(cfg.gated_layers),
         "gpu_budget_gb": gpu_budget_gb, "reserve_gb": reserve_gb,
-        "strategy": strategy, "reschedule_every": reschedule_every,
+        "vram_cap_gb": vram_cap_gb,
+        "strategy": strategy if sched is not None else None,
+        "reschedule_every": reschedule_every if sched is not None else 0,
         "reschedule_events": reschedule_events,
-        "resident_layers": len(sched.resident or []),
+        "resident_layers": len(resident or []),
         "resident_decoder_gb": round(resident_weights, 3),
         "io_gb": round(io_gb, 3),
         "total_decoder_gb": round(total_weights, 3),
@@ -206,6 +257,10 @@ def main(
                 f"({report['resident_decoder_gb'] + report['io_gb']:.2f}GB weights on GPU), "
                 f"ROUGE-L {rouge:.3f} seq-rep-4 {rep:.3f} skip_hits {report['skip_hits_decode']}")
     logger.info(f"[edge] report -> {out_path}")
+    if vram_cap_gb > 0 and device.type == "cuda":
+        assert report["gpu_peak_alloc_gb"] <= vram_cap_gb + 0.01, (
+            f"peak alloc {report['gpu_peak_alloc_gb']}GB breached the "
+            f"{vram_cap_gb}GB cap — arm invalid")
 
 
 def _io_modules(model):

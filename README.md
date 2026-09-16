@@ -12,12 +12,17 @@ Two gating schemes, one switch (`--gate_mode`), one shared fixed/gated layer des
 | **MoL** (Mixture of Layers) | `mol` (canonical `moe`) | one joint router at the gated-region entry picks the layer subset, MoE-style |
 
 Both target **edge-side memory demand**: a smaller GPU footprint (selective weights
-residency + sparse KV cache; the validated 7B recipe runs k = 16.1/28 layers for
-−42% weight demand and −41% KV demand), a **schedulable** layer set driven by the
+residency + sparse KV cache; the validated 7B recipe runs k = 20.0/28 total layers
+for −28% weight demand and −28% KV demand), a **schedulable** layer set driven by the
 router's own activation statistics, and accuracy recovered via a unified
 **post-training repair** pipeline (joint LoRA repair + a fixed depth price + rollout
 unlikelihood against repetition; KL self-distillation and the accuracy-floor dual stay
-in-tree as optional arms, **off in the validated default**). The roadmap: repair on
+in-tree as optional arms, **off in the validated default**). Measured under a
+memory-constrained budget (single GPU capped at 6–8 GB VRAM + 16 CPU cores, CPU
+offload, no retraining): **1.34×/1.76×** wall-clock over an equal-budget dense-LoRA
+baseline, while a masking baseline (MoDification) that executes every layer gains
+nothing — only hard layer skipping accelerates in this regime
+([docs/paper.md §4.8](docs/paper.md)). The roadmap: repair on
 traditional self-attention first, then adapt to linear-attention backbones.
 
 ## 1. Core Idea
@@ -186,8 +191,9 @@ python3 finetune/train.py --model_id ./models/Qwen2.5-7B-Instruct --use_lora \
     --ul_mode rollout --rollout_tokens 128 --ul_coef 0.3 \
     --eval_every 2000 --patience 10 --anneal_steps 2000 --max_steps 4000 \
     --device cuda:0 --save_dir ./ckpt/run
-# converged headline (Qwen2.5-7B, full 904K SFT): held-out Δacc +4.3pt at k 16.1/28,
-# weight demand −42% (7.51 vs 13.05 GB), KV −41%, 128-tok ROUGE-L ≈ dense
+# converged headline (Qwen2.5-7B, full 904K SFT): held-out Δacc +4.3pt at k 20.0/28
+# total layers (hard deployment accounting), weight demand −28% (9.38 vs 13.05 GB),
+# KV −28%, 128-tok ROUGE-L 0.211 > raw dense 0.160
 # then: profile measured load -> promote fixed layers (>=90%) -> resume on new structure
 python3 finetune/profile_layers.py --ckpt ./ckpt/run --threshold 0.9 --out ./ckpt/run_fixed
 python3 finetune/train.py --resume_dir ./ckpt/run_fixed ...
@@ -217,8 +223,24 @@ for req in requests:
        │ hot gated layers  — picked by strategy │ ◄─swap─► │ layers compute   │
        │ KV cache + activations                 │  between │ here             │
        └────────────────────────────────────────┘    gens  └──────────────────┘
-        strategies: random | lru (recently-active first) | lfu (most-activated first)
+         strategies: random | lru (recently-active first) | lfu (most-activated first)
 ```
+
+Measured under a constrained budget (Qwen2.5-7B, single GPU capped via
+`torch.cuda.set_per_process_memory_fraction`, 16 pinned CPU cores, bf16, zero
+retraining; 20 prompts × 128 tok greedy; `tools/edge_bench.py --vram_cap_gb`):
+
+| VRAM cap | ours (hard skip) | dense-ft (equal-budget LoRA) | MoDification α0.01 (masking) |
+|---|---|---|---|
+| 6 GB | **182 ms/tok** (5.5 tok/s), 4/28 layers resident | 247 ms/tok (4.0) | 251 ms/tok (4.0) |
+| 8 GB | **124 ms/tok** (8.1 tok/s), 10/28 resident | 219 ms/tok (4.6) | 262 ms/tok (3.8) |
+
+Skipping converts to wall-clock exactly where memory binds (**1.34×/1.76×**; measured
+skips 8.2 layers/token match the probed hard k = 20/28); masking executes all 28
+layers and buys none; enlarging the budget favors sparsity (6→8 GB: ours 1.49× vs
+dense 1.13×) because the gates' skipped layers stay on the CPU unpaid. Full analysis
+and caveats (LFU rescheduling null result, IO-module tax, variance bands):
+[docs/paper.md §4.8](docs/paper.md).
 
 ## 8. Baselines (details: [docs/related-work.md](docs/related-work.md))
 
@@ -250,10 +272,12 @@ recovers +13pt, partial). Note: `SpeakerConfig`'s library-level default is still
   "syntax in fixed layers / reasoning in middle layers" emergence.
 - **P2 profile-promote-resume loop**: works (fixed layers 100%, mid layers 20-86% stay
   gated); pending end-to-end resume accuracy validation.
-- **P3 edge-side deployment**: placement + residency scheduling work (mixed-device
-  generation smoke passed); pending decode latency/memory benchmarks on real edge
-  hardware, and kernel/batched-ragged execution to convert FLOP savings (~2.4× at
-  k≈12/28) into wall-clock.
+- **P3 edge-side deployment**: ✅ constrained-budget benchmark done (6/8 GB VRAM cap +
+  16 cores, CPU offload, `tools/edge_bench.py`): 1.34×/1.76× over equal-budget
+  dense-ft, masking baselines no speedup, LFU rescheduling null (flat activation
+  frequencies); between-generation scheduling kept as machinery. Remaining: kernel /
+  batched-ragged execution to convert FLOP savings into wall-clock in the
+  whole-card-resident regime, and long-context runs where the −28% KV term binds.
 - **T1 (deferred)**: difficulty head decides k, router decides which; or decide masks
   at prefill and reuse at decode (composable with sparse KV).
 - **T2 (threshold mode only)**: make τ actually learn (own lr group).

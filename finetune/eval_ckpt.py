@@ -6,7 +6,6 @@ Usage: python3 finetune/eval_ckpt.py --ckpt /tmp/mod_ckpt_mix1 --data_path ... -
 """
 import gc
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -15,11 +14,10 @@ import torch
 import typer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from speaker import SpeakerConfig, convert_to_speaker
-from speaker.checkpoint import load_gate
+from baselines.assemble import ModelBuilder
 from speaker.evaluate import eval_heldout, format_k_quartile
 from speaker.log import logger
-from speaker.train_common import build_model, build_tok, eval_slice, resolve_device, wrap_lora
+from speaker.train_common import build_model, build_tok, eval_slice, resolve_device
 from data.sft import make_collate
 
 
@@ -63,20 +61,11 @@ def main(
         gc.collect()  # 7B: gc to break reference cycles before empty_cache, otherwise loading the second model OOMs
         torch.cuda.empty_cache()
 
-    m2 = build_model(model_id, device, dtype=torch.bfloat16,
-                     device_map=(device_map or None))
-    if use_lora:
-        m2 = wrap_lora(m2, lora_rank, lora_alpha, lora_targets)
-    cfg = SpeakerConfig.from_json(os.path.join(ckpt, "mod_config.json"))
-    mod = convert_to_speaker(m2, cfg)
-    if not device_map:
-        mod = mod.to(device)
-    missing, unexp = load_gate(mod, ckpt)
-    if missing or unexp:
-        logger.warning(f"gate.pt loaded, missing {len(missing)} unexpected {len(unexp)}")
-    else:
-        logger.info("gate.pt loaded, no missing/unexpected keys")
-    mod.set_skip_mode("hard")
+    lora = (dict(rank=lora_rank, alpha=lora_alpha, targets=lora_targets)
+            if use_lora else None)
+    mod = (ModelBuilder(model_id, lora=lora, dtype=torch.bfloat16,
+                        device_map=(device_map or None))
+           .from_ckpt(ckpt).skip_mode("hard").build(None if device_map else device).model)
     m = eval_heldout(mod, texts, coll, batch_size)
     logger.info(f"mod   loss {m['loss']:.3f} acc {m['acc']:.3f} "
                 f"(Δloss {m['loss'] - d['loss']:+.3f} Δacc {m['acc'] - d['acc']:+.3f}) "

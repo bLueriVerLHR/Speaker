@@ -195,9 +195,18 @@ class SpeakerConfig:
     def to_dict(self) -> dict:
         return {**asdict(self), "gated_layers": self.gated_layers}
 
-    def to_json(self, path: str):
+    def to_json(self, path: str, extra: Optional[dict] = None):
+        """Persist the validated routing config plus optional loader metadata.
+
+        ``extra`` is intentionally ignored by :meth:`from_json`'s schema filter;
+        it lets training record adapter details without expanding the model
+        configuration dataclass or changing its numerical defaults.
+        """
+        payload = self.to_dict()
+        if extra:
+            payload.update(extra)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+            json.dump(payload, f, indent=2, ensure_ascii=False)
 
     @classmethod
     def from_json(cls, path: str) -> "SpeakerConfig":

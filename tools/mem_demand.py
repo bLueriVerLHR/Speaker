@@ -107,16 +107,14 @@ def main(
     from speaker.terminal import setup_terminal
     setup_terminal()
     from transformers import AutoConfig
-    from transformers import AutoModelForCausalLM
+    from speaker.train_common import build_model
     import torch
     from speaker.log import logger
 
     cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
     kv_B = kv_layer_bytes_from_config(cfg, dtype_bytes)
     n = int(cfg.num_hidden_layers)
-    m = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=torch.bfloat16, device_map=None,
-        trust_remote_code=True, low_cpu_mem_usage=True).to("cpu")
+    m = build_model(model_id, torch.device("cpu"), dtype=torch.bfloat16)
     dec_gb, _, _ = decoder_gb_from_model(m)
     row = demand(k_mean, n, dec_gb, kv_B, ctx)
     row.update({"model_id": model_id, "n_layers": n, "decoder_gb": dec_gb,

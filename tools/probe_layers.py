@@ -8,7 +8,7 @@ from typing import Annotated
 
 import torch
 import typer
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 sys.path.insert(0, str(_P(__file__).resolve().parents[1]))
 from data.sft import SFTDataset, make_collate
 from speaker.evaluate import eval_heldout
@@ -39,8 +39,8 @@ def main(
     full = SFTDataset(data_path, offset + n)
     texts = full.samples[offset:offset + n]
     logger.info(f"heldout {len(texts)}")
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16,
-        device_map=None, trust_remote_code=True, low_cpu_mem_usage=True).to(device)
+    from speaker.train_common import build_model
+    model = build_model(model_id, device, dtype=torch.bfloat16)
     layers = find_layers(model)
     N = len(layers)
     coll = make_collate(tok, device, 256)

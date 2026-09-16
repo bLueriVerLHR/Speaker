@@ -18,13 +18,18 @@ from typing import List
 import torch
 
 
-def apply_placement(hub, resident_ids, gpu_device="cuda", cpu_device="cpu") -> List[int]:
+def apply_placement(hub, resident_ids, gpu_device="cuda", cpu_device="cpu",
+                    force_always_gpu: bool = True) -> List[int]:
     """Hierarchical placement: hot layers (resident + high frequency) on GPU, cold layers on
     CPU. forward moves tensors across device boundaries automatically.
     resident_ids: layer indices kept on GPU; the remaining gated layers move to CPU
     (always_on forced to stay on GPU).
+    force_always_gpu=False lifts that pin (dense-wrap: every layer is always_on, pinning
+    them all would force the whole stack onto the GPU regardless of the budget).
     moe's JointRouter follows the hf_model's main device; _compute_route aligns devices internally."""
-    resident = set(resident_ids) | set(hub.mod_config.always_on_layers)
+    resident = set(resident_ids)
+    if force_always_gpu:
+        resident |= set(hub.mod_config.always_on_layers)
     gd = torch.device(gpu_device)
     cd = torch.device(cpu_device)
     for w in hub.layers:

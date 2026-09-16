@@ -438,10 +438,13 @@ class SpeakerModelWrapper(nn.Module):
 
     # ----- Placement (bodies in speaker/placement.py; delegates keep call sites stable) -----
 
-    def set_placement(self, resident_ids, gpu_device="cuda", cpu_device="cpu"):
-        """Hierarchical placement: hot layers on GPU, cold layers on CPU (always_on forced GPU)."""
+    def set_placement(self, resident_ids, gpu_device="cuda", cpu_device="cpu",
+                      force_always_gpu: bool = True):
+        """Hierarchical placement: hot layers on GPU, cold layers on CPU (always_on forced GPU
+        unless force_always_gpu=False, the dense-wrap escape hatch)."""
         from .placement import apply_placement
-        return apply_placement(self, resident_ids, gpu_device, cpu_device)
+        return apply_placement(self, resident_ids, gpu_device, cpu_device,
+                               force_always_gpu=force_always_gpu)
 
     def resident_gb(self, device_type="cuda"):
         """Resident parameter size on the given device (GB, weights only)."""

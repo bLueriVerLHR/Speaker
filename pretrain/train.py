@@ -190,6 +190,10 @@ def main(
     window_t0 = time.time()
     window_tokens = 0
     mod_model.train()
+    # From-scratch runs intentionally use the hard step cap rather than the
+    # finetune StopOnPlateau rule: a random-init loss curve has no meaningful
+    # dense held-out baseline during the early ramp. Keep this split explicit
+    # so the two tracks' convergence protocols are not mistaken for drift.
     for epoch in range(100):
         for b in dl:
             step += 1
@@ -208,7 +212,9 @@ def main(
             ema_lm = ema_update(ema_lm, lm_loss.item())
             ema_acc = dual.observe(step, acc_item)
             with torch.no_grad():
-                counts = mod_model.get_active_counts()
+                # Report deployment cost (always-on + selected gated layers), the
+                # same total-k convention used by finetune and evaluation.
+                counts = mod_model.get_total_counts()
                 valid = b["attention_mask"].bool()
                 if counts is not None and valid.any():
                     ks = counts[valid].float()

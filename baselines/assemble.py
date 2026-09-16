@@ -124,6 +124,21 @@ def _lora_spec(cfg: dict, cli: dict | None) -> dict:
                 targets=cfg.get("lora_targets") or cli.get("targets", "q_proj,v_proj"))
 
 
+def lora_from_checkpoint(cfg: dict, cli: dict | None = None) -> dict | None:
+    """Return the persisted adapter recipe, with legacy CLI fallback.
+
+    Older checkpoints did not record ``use_lora``; in that case the caller's
+    explicit CLI choice remains authoritative. New checkpoints are self
+    describing and cannot silently load adapter weights into a dense model.
+    """
+    if "use_lora" in cfg:
+        return _lora_spec(cfg, cli) if cfg["use_lora"] else None
+    if cli is not None:
+        logger.warning("checkpoint has no persisted LoRA spec; falling back to CLI "
+                       "rank/alpha/targets (legacy checkpoint)")
+    return _lora_spec(cfg, cli) if cli is not None else None
+
+
 class ModelBuilder:
     """Fluent builder; from_ckpt records intent, build() runs the family pipeline."""
 
@@ -203,8 +218,9 @@ class ModelBuilder:
 @register_family("ours", "mod_config.json", "ours")
 def _build_ours(b: "ModelBuilder", asm: Assembly) -> Assembly:
     m = b._load_base()
-    if b.lora is not None:
-        m = _wrap_peft(m, **b.lora)
+    spec = lora_from_checkpoint(b.cfg, b.lora)
+    if spec is not None:
+        m = _wrap_peft(m, **spec)
     from speaker.config import SpeakerConfig
     from speaker.wrapper import convert_to_speaker, apply_decode_config
     m = convert_to_speaker(m, SpeakerConfig.from_json(
